@@ -48,6 +48,8 @@ const allowedOrigins = [
   'http://februaryfantasy-production.up.railway.app',
   'https://pleasing-determination-production.up.railway.app',
   'http://pleasing-determination-production.up.railway.app',
+  'https://prizepicks-production.up.railway.app',  // NEW PRIMARY DOMAIN
+  'http://prizepicks-production.up.railway.app',   // NEW PRIMARY DOMAIN
   'http://localhost:19006',
   'http://localhost:3000',
   'http://localhost:3001',
@@ -183,7 +185,7 @@ const swaggerOptions = {
       license: { name: 'MIT', url: 'https://opensource.org/licenses/MIT' }
     },
     servers: [
-      { url: 'https://pleasing-determination-production.up.railway.app', description: 'Production server' },
+      { url: 'https://prizepicks-production.up.railway.app', description: 'Production server' }, // UPDATED
       { url: 'http://localhost:3002', description: 'Local development server' }
     ],
     components: {
@@ -729,7 +731,6 @@ function generateIntelligentFantasyFallback() {
 // All other endpoints (NBA games, NFL games, etc.) remain exactly as in your original file
 // ====================
 // (Include all your existing endpoints from your original server.js – they are unchanged)
-// For brevity, I'm not repeating them here, but you must keep them.
 // Example: app.get('/api/nba/games', ...) etc.
 
 // ====================
@@ -832,9 +833,9 @@ async function startServer() {
     const server = app.listen(PORT, HOST, () => {
       console.log(`\n🎉 Server running on ${HOST}:${PORT}`);
       console.log(`🌐 CORS Enabled for: ${allowedOrigins.length} origins`);
-      console.log(`🏥 Health: https://pleasing-determination-production.up.railway.app/health`);
-      console.log(`📚 Docs: https://pleasing-determination-production.up.railway.app/api-docs`);
-      console.log(`🔧 API: https://pleasing-determination-production.up.railway.app/api`);
+      console.log(`🏥 Health: https://prizepicks-production.up.railway.app/health`);      // UPDATED
+      console.log(`📚 Docs: https://prizepicks-production.up.railway.app/api-docs`);      // UPDATED
+      console.log(`🔧 API: https://prizepicks-production.up.railway.app/api`);            // UPDATED
       console.log(`\n📊 DATA SOURCES:`);
       console.log(`   ✅ NBA API Service (NBA Data API) – no key required`);
       console.log(`   ✅ The Odds API – key present: ${!!(process.env.ODDS_API_KEY || process.env.THE_ODDS_API_KEY)}`);
