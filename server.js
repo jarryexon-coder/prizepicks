@@ -1,4 +1,4 @@
-// server.js - FINAL COMPLETE PRODUCTION WITH NBA API SERVICE
+// server.js - FINAL COMPLETE PRODUCTION WITH NBA API SERVICE AND 2026 STATIC DATA
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -19,8 +19,33 @@ const app = express();
 const PORT = process.env.PORT || 3002;
 const HOST = process.env.HOST || '0.0.0.0';
 
-console.log('🚀 NBA Fantasy AI Backend - FINAL PRODUCTION v3.3 (with NBA API Service)');
+console.log('🚀 NBA Fantasy AI Backend - FINAL PRODUCTION v3.4 (with NBA API Service + 2026 Static Data)');
 console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+
+// ====================
+// GLOBAL STATIC PLAYERS CACHE (from Python API)
+// ====================
+let staticNBAPlayers = [];
+
+async function fetchStaticNBAPlayers() {
+  const pythonApiUrl = process.env.PYTHON_API_URL || 'https://python-api-fresh-production.up.railway.app';
+  try {
+    console.log('📡 Fetching static NBA players from Python API...');
+    const response = await axios.get(`${pythonApiUrl}/api/fantasy/players`, {
+      params: { sport: 'nba', realtime: 'false', limit: 200 },
+      timeout: 10000
+    });
+    if (response.data.success && Array.isArray(response.data.players)) {
+      console.log(`✅ Loaded ${response.data.players.length} static NBA players`);
+      return response.data.players;
+    }
+    console.warn('⚠️ Python API returned no players, using empty array');
+    return [];
+  } catch (error) {
+    console.error('❌ Failed to fetch static NBA players from Python API:', error.message);
+    return [];
+  }
+}
 
 // ====================
 // REDIS CLIENT (Optional)
@@ -180,12 +205,12 @@ const swaggerOptions = {
     openapi: '3.0.0',
     info: {
       title: 'NBA Fantasy AI API',
-      version: '3.3.0',
-      description: 'NBA Fantasy AI Backend API Documentation',
+      version: '3.4.0',
+      description: 'NBA Fantasy AI Backend API Documentation (with 2026 static data)',
       license: { name: 'MIT', url: 'https://opensource.org/licenses/MIT' }
     },
     servers: [
-      { url: 'https://prizepicks-production.up.railway.app', description: 'Production server' }, // UPDATED
+      { url: 'https://prizepicks-production.up.railway.app', description: 'Production server' },
       { url: 'http://localhost:3002', description: 'Local development server' }
     ],
     components: {
@@ -212,7 +237,7 @@ try {
 }
 
 // ====================
-// RESPONSE CONVERTER MIDDLEWARE (unchanged from your version)
+// RESPONSE CONVERTER MIDDLEWARE (unchanged)
 // ====================
 app.use((req, res, next) => {
   console.log(`🛠️ Request to: ${req.path}`);
@@ -250,7 +275,6 @@ app.use((req, res, next) => {
         }
         data.standings = allTeams;
       }
-      // PrizePicks Analytics conversion (if needed)
     }
     return originalJson.call(this, data);
   };
@@ -264,7 +288,7 @@ console.log('🔧 Response converter middleware loaded - BEFORE all routes');
 app.get('/', (req, res) => {
   res.json({
     service: 'NBA Fantasy AI Backend',
-    version: '3.3.0',
+    version: '3.4.0',
     status: 'running',
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || 'development',
@@ -279,7 +303,8 @@ app.get('/', (req, res) => {
     },
     data_sources: {
       nba_api_service: 'Active (NBA Data API)',
-      the_odds_api: process.env.ODDS_API_KEY ? 'Key present' : 'Key missing (using fallback)'
+      the_odds_api: process.env.ODDS_API_KEY ? 'Key present' : 'Key missing (using fallback)',
+      static_2026_python: staticNBAPlayers.length > 0 ? `Loaded ${staticNBAPlayers.length} players` : 'Not loaded yet'
     }
   });
 });
@@ -288,7 +313,7 @@ app.get('/health', (req, res) => {
   const health = {
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    version: '3.3.0',
+    version: '3.4.0',
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     redis: redisClient?.status || 'disabled',
@@ -297,7 +322,8 @@ app.get('/health', (req, res) => {
     api_sources: {
       nba_api_service: 'active',
       the_odds_api: process.env.ODDS_API_KEY ? 'key found' : 'key missing',
-      rapidapi_key: process.env.RAPIDAPI_KEY ? 'present' : 'missing'
+      rapidapi_key: process.env.RAPIDAPI_KEY ? 'present' : 'missing',
+      static_2026_python: staticNBAPlayers.length
     }
   };
   if (mongoose.connection.readyState === 1) health.mongodb = 'connected';
@@ -309,9 +335,9 @@ app.get('/railway-health', (req, res) => {
     status: 'ok',
     timestamp: Date.now(),
     service: 'NBA Fantasy API',
-    version: '3.3.0',
+    version: '3.4.0',
     cors: { clientOrigin: req.headers.origin || 'unknown', allowed: true },
-    api_integrations: { nba_api_service: 'active', the_odds_api: process.env.ODDS_API_KEY ? 'key found' : 'key missing' }
+    api_integrations: { nba_api_service: 'active', the_odds_api: process.env.ODDS_API_KEY ? 'key found' : 'key missing', static_2026_python: staticNBAPlayers.length }
   });
 });
 
@@ -319,7 +345,7 @@ app.get('/api', (req, res) => {
   res.json({
     success: true,
     message: 'NBA Fantasy AI API Gateway',
-    version: '3.3.0',
+    version: '3.4.0',
     timestamp: new Date().toISOString(),
     client: { origin: req.headers.origin || 'unknown', ip: req.ip, userAgent: req.headers['user-agent'] },
     documentation: { swaggerUI: '/api-docs', swaggerJSON: '/api-docs.json' },
@@ -331,9 +357,9 @@ app.get('/api', (req, res) => {
       { path: '/api/games', description: 'Game schedules and results' },
       { path: '/api/news', description: 'Sports news and updates' },
       { path: '/api/sportsbooks', description: 'Sports betting data' },
-      { path: '/api/prizepicks/selections', description: 'PrizePicks selections (The Odds API)' },
-      { path: '/api/fantasyhub/players', description: 'Fantasy Hub with NBA API stats' },
-      { path: '/api/theoddsapi/playerprops', description: 'Direct The Odds API player props' },
+      { path: '/api/prizepicks/selections', description: 'PrizePicks selections (The Odds API + 2026 static data)' },
+      { path: '/api/fantasyhub/players', description: 'Fantasy Hub with NBA API stats + 2026 static base' },
+      { path: '/api/theoddsapi/playerprops', description: 'Direct The Odds API player props (enriched with static data)' },
       { path: '/api/system/status', description: 'System status and API health' }
     ]
   });
@@ -357,13 +383,14 @@ app.get('/api/test', (req, res) => {
     api_integrations: {
       nba_api_service: 'active',
       the_odds_api: process.env.ODDS_API_KEY ? 'key found' : 'key missing',
-      rapidapi_key: process.env.RAPIDAPI_KEY ? 'present' : 'missing'
+      rapidapi_key: process.env.RAPIDAPI_KEY ? 'present' : 'missing',
+      static_2026_python: staticNBAPlayers.length
     }
   });
 });
 
 // ====================
-// PRIZEPICKS ENDPOINT (USING THE ODDS API WITH YOUR KEY)
+// PRIZEPICKS ENDPOINT (USING THE ODDS API + STATIC ENRICHMENT)
 // ====================
 async function fetchPlayerPropsFromOddsAPI(sport = 'basketball_nba') {
   console.log(`🎯 [The Odds API] Fetching player props for ${sport}...`);
@@ -423,40 +450,93 @@ async function fetchPlayerPropsFromOddsAPI(sport = 'basketball_nba') {
   }
 }
 
+// Helper to match player name with static data (simple contains)
+function findStaticPlayer(playerName) {
+  if (!staticNBAPlayers.length) return null;
+  return staticNBAPlayers.find(p => 
+    playerName.toLowerCase().includes(p.name.toLowerCase()) ||
+    p.name.toLowerCase().includes(playerName.toLowerCase())
+  );
+}
+
 app.get('/api/prizepicks/selections', async (req, res) => {
-  const sport = req.query.sport || 'nba';
-  const sportKey = sport === 'nba' ? 'basketball_nba' : 'americanfootball_nfl';
-  const cacheKey = `prizepicks_${sport}`;
-
-  console.log(`🎰 [PrizePicks Endpoint] Request for ${sport.toUpperCase()}`);
-
-  const cached = cache.get(cacheKey);
-  if (cached) {
-    console.log('   ✅ Serving from cache');
-    return res.json({ ...cached, servedFrom: 'cache' });
-  }
-
   try {
-    const playerProps = await fetchPlayerPropsFromOddsAPI(sportKey);
-    if (playerProps.length === 0) throw new Error('No player props data available');
+    const sport = req.query.sport || 'nba';
+    const sportKey = sport === 'nba' ? 'basketball_nba' : 'americanfootball_nfl';
+    const cacheKey = `prizepicks_${sport}`;
 
-    const selections = playerProps.map((prop, index) => ({
-      id: `odds-${index}-${Date.now()}`,
-      player: prop.player,
-      team: prop.player.split(' ').pop(),
-      sport: sport.toUpperCase(),
-      stat: prop.prop_type,
-      line: prop.line,
-      type: prop.type,
-      projection: prop.line,
-      confidence: 'medium',
-      odds: prop.odds ? `+${Math.round((prop.odds - 1) * 100)}` : '-110',
-      timestamp: new Date().toISOString(),
-      analysis: `${prop.player} ${prop.prop_type} in ${prop.game}`,
-      status: 'pending',
-      source: 'the-odds-api',
-      bookmaker: prop.bookmaker
-    }));
+    console.log(`🎰 [PrizePicks Endpoint] Request for ${sport.toUpperCase()}`);
+
+    // Check cache
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      console.log('   ✅ Serving from cache');
+      return res.json({ ...cached, servedFrom: 'cache' });
+    }
+
+    let selections = [];
+    let source = 'fallback';
+
+    try {
+      // Primary source: The Odds API
+      const playerProps = await fetchPlayerPropsFromOddsAPI(sportKey);
+      if (playerProps.length > 0) {
+        selections = playerProps.map((prop, index) => {
+          const staticPlayer = findStaticPlayer(prop.player);
+          return {
+            id: `odds-${index}-${Date.now()}`,
+            player: prop.player,
+            team: staticPlayer?.team || prop.player.split(' ').pop(),
+            sport: sport.toUpperCase(),
+            position: staticPlayer?.position || 'N/A',
+            injury_status: staticPlayer?.injury_status || 'healthy',
+            stat: prop.prop_type,
+            line: prop.line,
+            type: prop.type,
+            projection: prop.line,
+            confidence: 'medium',
+            odds: prop.odds ? `+${Math.round((prop.odds - 1) * 100)}` : '-110',
+            timestamp: new Date().toISOString(),
+            analysis: `${prop.player} ${prop.prop_type} in ${prop.game}`,
+            status: 'pending',
+            source: 'the-odds-api',
+            bookmaker: prop.bookmaker
+          };
+        });
+        source = 'the-odds-api+static';
+      }
+    } catch (primaryError) {
+      console.error('   ❌ Primary source failed:', primaryError.message);
+      // Fall through to fallback
+    }
+
+    // If primary returned no selections, use fallback
+    if (selections.length === 0) {
+      console.log('   🔄 Using fallback data generation');
+      if (staticNBAPlayers && staticNBAPlayers.length > 0) {
+        selections = staticNBAPlayers.slice(0, 50).map((p, i) => ({
+          id: `static-${i}`,
+          player: p.name,
+          team: p.team,
+          position: p.position,
+          injury_status: p.injury_status,
+          sport: sport.toUpperCase(),
+          stat: 'points',
+          line: p.points,
+          type: 'over',
+          projection: p.points * 1.05,
+          confidence: 'medium',
+          odds: '-110',
+          timestamp: new Date().toISOString(),
+          analysis: `Based on season average ${p.points} ppg`,
+          source: 'static_2026'
+        }));
+        source = 'static_2026';
+      } else {
+        selections = generateIntelligentFallbackData(sport);
+        source = 'intelligent_fallback';
+      }
+    }
 
     const responsePayload = {
       success: true,
@@ -464,28 +544,32 @@ app.get('/api/prizepicks/selections', async (req, res) => {
       selections,
       count: selections.length,
       timestamp: new Date().toISOString(),
-      source: 'the-odds-api'
+      source
     };
+
+    // Cache the result (even fallback, to avoid repeated failures)
     cache.set(cacheKey, responsePayload);
-    console.log(`   ✅ Served ${selections.length} live player props`);
+    console.log(`   ✅ Served ${selections.length} selections from ${source}`);
     res.json(responsePayload);
+
   } catch (error) {
-    console.error('   ❌ Primary source failed:', error.message);
-    const fallbackSelections = generateIntelligentFallbackData(sport);
+    // Catch any unexpected error and return JSON fallback
+    console.error('🔥 Unhandled error in /api/prizepicks/selections:', error);
+    const fallbackSelections = generateIntelligentFallbackData(req.query.sport || 'nba');
     res.json({
       success: true,
-      message: `Player Props (Fallback)`,
+      message: 'Player Props (Emergency Fallback)',
       selections: fallbackSelections,
       count: fallbackSelections.length,
       timestamp: new Date().toISOString(),
-      source: 'fallback',
+      source: 'emergency_fallback',
       note: error.message
     });
   }
 });
 
 // ====================
-// FANTASY HUB ENDPOINT (USING NBA API SERVICE)
+// FANTASY HUB ENDPOINT (USING NBA API SERVICE + STATIC BASE)
 // ====================
 app.get('/api/fantasyhub/players', async (req, res) => {
   console.log('🏀 [FantasyHub Endpoint] Request for today');
@@ -498,8 +582,36 @@ app.get('/api/fantasyhub/players', async (req, res) => {
   }
 
   try {
-    // Start with expanded fallback list (realistic player data)
-    const basePlayers = generateIntelligentFantasyFallback(); // array of player objects with name, team, position, etc.
+    // Use static players as base (if available), otherwise fallback to generated list
+    let basePlayers = [];
+    if (staticNBAPlayers.length > 0) {
+      basePlayers = staticNBAPlayers.map(p => ({
+        // Convert static player to the structure expected by enrichment
+        player_id: `static-${p.name.replace(/\s+/g, '_')}`,
+        name: p.name,
+        team: p.team,
+        position: p.position,
+        injury_status: p.injury_status,
+        historical_stats: {
+          season_averages: {
+            points: p.points || 0,
+            rebounds: p.rebounds || 0,
+            assists: p.assists || 0,
+            steals: p.steals || 0,
+            blocks: p.blocks || 0,
+            field_goal_pct: p.field_goal_pct || 0,
+            games_played: p.games_played || 0
+          }
+        },
+        projection: { stat_type: 'Points', line: p.points, confidence: 'medium', updated: new Date().toISOString() },
+        context: { matchup: 'TBD', game_time: new Date().toISOString(), position: p.position },
+        fantasy_score: null,
+        recommendation: null
+      }));
+    } else {
+      console.log('   ⚠️ No static players, using generated fallback');
+      basePlayers = generateIntelligentFantasyFallback();
+    }
     
     // Enrich each player with real stats from NBA API service
     const enrichedPlayers = [];
@@ -514,7 +626,7 @@ app.get('/api/fantasyhub/players', async (req, res) => {
             historical_stats: {
               player_id: realStats.playerId,
               position: realStats.position || player.position,
-              height: 'N/A', // not provided by NBA Data API
+              height: 'N/A',
               weight: 'N/A',
               season_averages: {
                 points: realStats.seasonStats?.points || player.historical_stats?.season_averages?.points,
@@ -530,11 +642,11 @@ app.get('/api/fantasyhub/players', async (req, res) => {
             source: 'nba_api_service'
           });
         } else {
-          enrichedPlayers.push({ ...player, enriched: false, source: 'fallback' });
+          enrichedPlayers.push({ ...player, enriched: false, source: staticNBAPlayers.length ? 'static_2026' : 'fallback' });
         }
       } catch (error) {
         console.log(`   ⚠️ Error enriching ${player.name}: ${error.message}`);
-        enrichedPlayers.push({ ...player, enriched: false, source: 'fallback', error: error.message });
+        enrichedPlayers.push({ ...player, enriched: false, source: staticNBAPlayers.length ? 'static_2026' : 'fallback', error: error.message });
       }
       // Small delay to be gentle
       await new Promise(resolve => setTimeout(resolve, 100));
@@ -551,7 +663,7 @@ app.get('/api/fantasyhub/players', async (req, res) => {
         total: enrichedPlayers.length,
         enriched: enrichedPlayers.filter(p => p.enriched).length,
         failed: enrichedPlayers.filter(p => !p.enriched).length,
-        source: 'nba_api_service'
+        source: staticNBAPlayers.length ? 'static_2026+nba_api' : 'fallback+nba_api'
       }
     });
 
@@ -571,7 +683,7 @@ app.get('/api/fantasyhub/players', async (req, res) => {
 });
 
 // ====================
-// DIRECT THE ODDS API ENDPOINT
+// DIRECT THE ODDS API ENDPOINT (with static enrichment)
 // ====================
 app.get('/api/theoddsapi/playerprops', async (req, res) => {
   const sport = req.query.sport || 'basketball_nba';
@@ -581,11 +693,22 @@ app.get('/api/theoddsapi/playerprops', async (req, res) => {
 
   try {
     const playerProps = await fetchPlayerPropsFromOddsAPI(sport);
+    // Enrich each prop with static player info
+    const enrichedProps = playerProps.map(prop => {
+      const staticPlayer = findStaticPlayer(prop.player);
+      return {
+        ...prop,
+        player_team: staticPlayer?.team,
+        player_position: staticPlayer?.position,
+        injury_status: staticPlayer?.injury_status
+      };
+    });
+
     const response = {
       success: true,
-      count: playerProps.length,
-      source: 'the-odds-api',
-      data: playerProps,
+      count: enrichedProps.length,
+      source: 'the-odds-api+static',
+      data: enrichedProps,
       retrieved: new Date().toISOString()
     };
     cache.set(cacheKey, response);
@@ -601,23 +724,24 @@ app.get('/api/theoddsapi/playerprops', async (req, res) => {
 app.get('/api/system/status', (req, res) => {
   const status = {
     timestamp: new Date().toISOString(),
-    version: 'v3.3',
+    version: 'v3.4',
     endpoints: {
-      prizepicks: { path: '/api/prizepicks/selections', status: '✅ Healthy', source: 'the_odds_api' },
-      fantasyhub: { path: '/api/fantasyhub/players', status: '✅ Healthy', source: 'nba_api_service' },
-      odds_api: { path: '/api/theoddsapi/playerprops', status: '✅ Healthy', source: 'the_odds_api' }
+      prizepicks: { path: '/api/prizepicks/selections', status: '✅ Healthy', source: 'the_odds_api+static' },
+      fantasyhub: { path: '/api/fantasyhub/players', status: '✅ Healthy', source: 'nba_api_service+static' },
+      odds_api: { path: '/api/theoddsapi/playerprops', status: '✅ Healthy', source: 'the_odds_api+static' }
     },
     data_sources: {
       the_odds_api: { status: process.env.ODDS_API_KEY ? '✅ Active' : '⚠️ Missing key', key: process.env.ODDS_API_KEY ? 'present' : 'missing' },
       nba_api_service: { status: '✅ Active (NBA Data API)', note: 'Free, no key required' },
-      rapidapi: { status: process.env.RAPIDAPI_KEY ? '✅ Available' : '⚠️ Missing', key: process.env.RAPIDAPI_KEY ? 'present' : 'missing' }
+      rapidapi: { status: process.env.RAPIDAPI_KEY ? '✅ Available' : '⚠️ Missing', key: process.env.RAPIDAPI_KEY ? 'present' : 'missing' },
+      static_2026_python: { status: staticNBAPlayers.length ? `✅ Loaded (${staticNBAPlayers.length} players)` : '⚠️ Not loaded' }
     }
   };
   res.json(status);
 });
 
 // ====================
-// INTELLIGENT FALLBACK FUNCTIONS (EXPANDED)
+// INTELLIGENT FALLBACK FUNCTIONS (EXPANDED) - kept as backup
 // ====================
 function generateIntelligentFallbackData(sport = 'NBA') {
   console.log('   🛠️ Generating intelligent fallback data for PrizePicks');
@@ -732,6 +856,7 @@ function generateIntelligentFantasyFallback() {
 // ====================
 // (Include all your existing endpoints from your original server.js – they are unchanged)
 // Example: app.get('/api/nba/games', ...) etc.
+// ... (I'm omitting them for brevity, but they are unchanged)
 
 // ====================
 // CATCH-ALL FOR /api/* ROUTES
@@ -749,7 +874,8 @@ app.get('/api/*', (req, res) => {
     api_sources: {
       nba_api_service: 'active',
       the_odds_api: process.env.ODDS_API_KEY ? 'key present' : 'key missing',
-      rapidapi_key: process.env.RAPIDAPI_KEY ? 'present' : 'missing'
+      rapidapi_key: process.env.RAPIDAPI_KEY ? 'present' : 'missing',
+      static_2026_python: staticNBAPlayers.length
     },
     availableEndpoints: [
       '/api/nba', '/api/nba/games', '/api/nfl/games', '/api/nfl/stats', '/api/nfl/standings',
@@ -821,6 +947,9 @@ app.use(errorHandler);
 // ====================
 async function startServer() {
   try {
+    // Load static NBA players from Python API on startup
+    staticNBAPlayers = await fetchStaticNBAPlayers();
+
     if (process.env.MONGODB_URI) {
       try {
         await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000, socketTimeoutMS: 45000, maxPoolSize: 10 });
@@ -833,17 +962,18 @@ async function startServer() {
     const server = app.listen(PORT, HOST, () => {
       console.log(`\n🎉 Server running on ${HOST}:${PORT}`);
       console.log(`🌐 CORS Enabled for: ${allowedOrigins.length} origins`);
-      console.log(`🏥 Health: https://prizepicks-production.up.railway.app/health`);      // UPDATED
-      console.log(`📚 Docs: https://prizepicks-production.up.railway.app/api-docs`);      // UPDATED
-      console.log(`🔧 API: https://prizepicks-production.up.railway.app/api`);            // UPDATED
+      console.log(`🏥 Health: https://prizepicks-production.up.railway.app/health`);
+      console.log(`📚 Docs: https://prizepicks-production.up.railway.app/api-docs`);
+      console.log(`🔧 API: https://prizepicks-production.up.railway.app/api`);
       console.log(`\n📊 DATA SOURCES:`);
       console.log(`   ✅ NBA API Service (NBA Data API) – no key required`);
       console.log(`   ✅ The Odds API – key present: ${!!(process.env.ODDS_API_KEY || process.env.THE_ODDS_API_KEY)}`);
       console.log(`   ✅ RapidAPI – key present: ${!!process.env.RAPIDAPI_KEY}`);
+      console.log(`   ✅ 2026 Static NBA Players – loaded: ${staticNBAPlayers.length}`);
       console.log(`\n🎯 KEY ENDPOINTS:`);
-      console.log(`   GET /api/prizepicks/selections - PrizePicks selections (The Odds API)`);
-      console.log(`   GET /api/fantasyhub/players   - Fantasy Hub with NBA API stats`);
-      console.log(`   GET /api/theoddsapi/playerprops - Raw The Odds API player props`);
+      console.log(`   GET /api/prizepicks/selections - PrizePicks selections (The Odds API + static enrichment)`);
+      console.log(`   GET /api/fantasyhub/players   - Fantasy Hub with NBA API stats + static base`);
+      console.log(`   GET /api/theoddsapi/playerprops - Raw The Odds API player props (enriched with static)`);
       console.log(`\n✅ Server ready!`);
     });
 
