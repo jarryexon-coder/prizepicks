@@ -647,7 +647,10 @@ app.get('/api/fantasyhub/players', async (req, res) => {
           enrichedPlayers.push({ ...player, enriched: false, source: staticNBAPlayers.length ? 'static_2026' : 'fallback' });
         }
       } catch (error) {
-        console.log(`   ⚠️ Error enriching ${player.name}: ${error.message}`);
+        // Only log the first few errors to avoid spam
+        if (enrichedPlayers.length < 5) {
+          console.log(`   ⚠️ Error enriching ${player.name}: ${error.message}`);
+        }
         enrichedPlayers.push({ ...player, enriched: false, source: staticNBAPlayers.length ? 'static_2026' : 'fallback', error: error.message });
       }
       // Small delay to be gentle
@@ -1085,8 +1088,9 @@ async function startServer() {
       }
     }
 
-    // ADDED: MongoDB connection for fantasy draft database (localhost)
-    mongoose.connect('mongodb://localhost:27017/fantasydb', {
+    // MongoDB connection for fantasy draft database – use MONGO_URI env var
+    const mongoUri = process.env.MONGO_URI || 'mongodb://localhost:27017/fantasydb';
+    mongoose.connect(mongoUri, {
       useNewUrlParser: true,
       useUnifiedTopology: true
     })
