@@ -14,6 +14,8 @@ import rateLimit from 'express-rate-limit';
 
 // Import the NBA API service
 import nbaApiService from './services/nbaApiService.js';
+// ADDED: Import DraftRecommendation model
+import DraftRecommendation from './models/DraftRecommendation.js';
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -719,6 +721,130 @@ app.get('/api/theoddsapi/playerprops', async (req, res) => {
 });
 
 // ====================
+// DRAFT ENDPOINTS (ADDED)
+// ====================
+
+// Helper function to get enriched players (reuses your existing logic)
+async function getEnrichedPlayers(sport = 'nba') {
+  const cacheKey = 'fantasyhub_players'; // Reuse same cache key as fantasyhub
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  // Fallback to generating fresh (similar to your /api/fantasyhub/players logic)
+  let basePlayers = [];
+  if (staticNBAPlayers.length > 0) {
+    basePlayers = staticNBAPlayers.map(p => ({
+      playerId: `static-${p.name.replace(/\s+/g, '_')}`,
+      name: p.name,
+      team: p.team,
+      position: p.position,
+      salary: p.salary || 5000,
+      projection: p.points || 0,
+      value: p.value || ((p.points || 0) / (p.salary || 5000)) * 1000,
+      injury_status: p.injury_status || 'Healthy',
+    }));
+  } else {
+    basePlayers = generateIntelligentFantasyFallback();
+  }
+
+  // Enrich with real stats (optional – you already have this in your original code)
+  // For simplicity, we'll use basePlayers as is
+  cache.set(cacheKey, basePlayers, 300); // cache for 5 minutes
+  return basePlayers;
+}
+
+// GET /api/draft/rankings
+app.get('/api/draft/rankings', async (req, res) => {
+  try {
+    const { sport = 'nba', position, scoring, limit = 50 } = req.query;
+    const players = await getEnrichedPlayers(sport);
+
+    let filtered = players;
+    if (position) {
+      filtered = filtered.filter(p => p.position === position);
+    }
+
+    // Sort by value (or projection if value missing)
+    filtered.sort((a, b) => (b.value || 0) - (a.value || 0));
+
+    const ranked = filtered.slice(0, parseInt(limit)).map((p, idx) => ({
+      playerId: p.playerId,
+      name: p.name,
+      team: p.team,
+      position: p.position,
+      salary: p.salary,
+      projectedPoints: p.projection || 0,
+      valueScore: p.value || 0,
+      adp: idx + 1, // placeholder – you could compute from historical drafts later
+      expertRank: idx + 1,
+      tier: Math.floor(idx / 12) + 1,
+      injuryRisk: p.injury_status || 'low',
+      keyFactors: ['Projected volume', 'Matchup', 'Injury status']
+    }));
+
+    res.json({ success: true, data: ranked, count: ranked.length, source: 'balldontlie-enriched' });
+  } catch (error) {
+    console.error('Error in /api/draft/rankings:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/draft/save
+app.post('/api/draft/save', async (req, res) => {
+  try {
+    const draftData = req.body;
+    // Ensure userId is present (you might get from auth)
+    if (!draftData.userId) {
+      return res.status(400).json({ success: false, error: 'userId is required' });
+    }
+    const draft = new DraftRecommendation(draftData);
+    await draft.save();
+    res.json({ success: true, draftId: draft._id });
+  } catch (error) {
+    console.error('Error saving draft:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/draft/history
+app.get('/api/draft/history', async (req, res) => {
+  try {
+    const { userId, sport, status } = req.query;
+    const query = {};
+    if (userId) query.userId = userId;
+    if (sport) query.sport = sport.toUpperCase();
+    if (status) query.status = status;
+
+    const drafts = await DraftRecommendation.find(query)
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+    res.json({ success: true, data: drafts, count: drafts.length });
+  } catch (error) {
+    console.error('Error fetching draft history:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/draft/strategies/popular
+app.get('/api/draft/strategies/popular', async (req, res) => {
+  try {
+    const { sport } = req.query;
+    const match = sport ? { sport: sport.toUpperCase(), status: 'completed' } : { status: 'completed' };
+    const strategies = await DraftRecommendation.aggregate([
+      { $match: match },
+      { $group: { _id: '$type', count: { $sum: 1 }, avgTotalValue: { $avg: '$totalValue' } } },
+      { $sort: { count: -1 } },
+      { $limit: 10 }
+    ]);
+    res.json({ success: true, data: strategies });
+  } catch (error) {
+    console.error('Error fetching popular strategies:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ====================
 // SYSTEM STATUS
 // ====================
 app.get('/api/system/status', (req, res) => {
@@ -953,11 +1079,19 @@ async function startServer() {
     if (process.env.MONGODB_URI) {
       try {
         await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000, socketTimeoutMS: 45000, maxPoolSize: 10 });
-        console.log('✅ MongoDB connected');
+        console.log('✅ MongoDB connected (main)');
       } catch (error) {
         console.log('⚠️  MongoDB connection failed:', error.message);
       }
     }
+
+    // ADDED: MongoDB connection for fantasy draft database (localhost)
+    mongoose.connect('mongodb://localhost:27017/fantasydb', {
+      useNewUrlParser: true,
+      useUnifiedTopology: true
+    })
+    .then(() => console.log('✅ MongoDB connected (fantasydb)'))
+    .catch(err => console.error('❌ MongoDB connection error (fantasydb):', err));
 
     const server = app.listen(PORT, HOST, () => {
       console.log(`\n🎉 Server running on ${HOST}:${PORT}`);
@@ -974,6 +1108,10 @@ async function startServer() {
       console.log(`   GET /api/prizepicks/selections - PrizePicks selections (The Odds API + static enrichment)`);
       console.log(`   GET /api/fantasyhub/players   - Fantasy Hub with NBA API stats + static base`);
       console.log(`   GET /api/theoddsapi/playerprops - Raw The Odds API player props (enriched with static)`);
+      console.log(`   GET /api/draft/rankings       - Draft rankings`);
+      console.log(`   POST /api/draft/save          - Save draft recommendation`);
+      console.log(`   GET /api/draft/history        - Draft history`);
+      console.log(`   GET /api/draft/strategies/popular - Popular draft strategies`);
       console.log(`\n✅ Server ready!`);
     });
 
