@@ -1,4 +1,3 @@
-// models/DraftRecommendation.js
 import mongoose from 'mongoose';
 
 const DraftPickSchema = new mongoose.Schema({
@@ -26,7 +25,8 @@ const DraftRecommendationSchema = new mongoose.Schema({
   picks: [DraftPickSchema],
   totalValue: { type: Number, default: 0 },
   averagePickScore: { type: Number, default: 0, min: 0, max: 100 },
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  // ✅ Changed from ObjectId to String to accept demo IDs like "demo-user-123"
+  userId: { type: String, required: true },
   status: { type: String, enum: ['completed', 'saved'], default: 'completed' },
 }, { timestamps: true });
 
