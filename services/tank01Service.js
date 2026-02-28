@@ -1,3 +1,4 @@
+// services/tank01Service.js
 import axios from 'axios';
 
 const RAPIDAPI_HOST = 'tank01-fantasy-stats.p.rapidapi.com';
@@ -105,4 +106,71 @@ export const getBoxScore = async (gameID, fantasyPoints = true) => {
   }
   const data = await callTank01('/getNBABoxScore', params);
   return data.body || {};
+};
+
+// ============= NEW FUNCTION: getPlayerList =============
+// Fetches all players (combines team rosters or uses a direct endpoint)
+export const getPlayerList = async (sport = 'nba') => {
+  console.log(`📋 Fetching player list for ${sport} from Tank01...`);
+  
+  try {
+    // For NBA, try to get all players. There are a few approaches:
+    
+    // Approach 1: If there's a direct endpoint for all players
+    // const data = await callTank01('/getNBAPlayers');
+    // return data.body || [];
+    
+    // Approach 2: Combine all team rosters (slower but works)
+    const teams = ['ATL', 'BOS', 'BKN', 'CHA', 'CHI', 'CLE', 'DAL', 'DEN', 'DET', 'GSW',
+                   'HOU', 'IND', 'LAC', 'LAL', 'MEM', 'MIA', 'MIL', 'MIN', 'NOP', 'NYK',
+                   'OKC', 'ORL', 'PHI', 'PHX', 'POR', 'SAC', 'SAS', 'TOR', 'UTA', 'WAS'];
+    
+    let allPlayers = [];
+    for (const team of teams) {
+      try {
+        const roster = await getTeamRoster(team);
+        if (Array.isArray(roster)) {
+          allPlayers = allPlayers.concat(roster);
+        } else if (roster && typeof roster === 'object') {
+          // Handle if roster is an object with players property
+          const players = roster.players || roster.roster || [];
+          allPlayers = allPlayers.concat(players);
+        }
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } catch (e) {
+        console.warn(`⚠️ Failed to fetch roster for ${team}:`, e.message);
+      }
+    }
+    
+    // Deduplicate by playerId
+    const uniquePlayers = Array.from(
+      new Map(allPlayers.map(p => [p.playerId || p.playerID, p])).values()
+    );
+    
+    console.log(`✅ Loaded ${uniquePlayers.length} unique players from Tank01`);
+    return uniquePlayers;
+    
+  } catch (error) {
+    console.error('❌ Error in getPlayerList:', error.message);
+    return []; // Return empty array on failure
+  }
+};
+
+// ============= DEFAULT EXPORT =============
+// This allows both named imports and default imports to work
+export default {
+  getADP,
+  getProjections,
+  getInjuries,
+  getNews,
+  getDepthCharts,
+  getGamesForDate,
+  getPlayerInfo,
+  getTeamRoster,
+  getCurrentInfo,
+  getBoxScore,
+  getPlayerList,  // Added the new function
+  // Aliases for backward compatibility
+  getPlayerListV2: getPlayerList
 };
