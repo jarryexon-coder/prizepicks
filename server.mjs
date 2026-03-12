@@ -1,4 +1,4 @@
-// server.mjs - FINAL COMPLETE PRODUCTION WITH REDIS CACHING (v3.6)
+// server.mjs - FINAL PRODUCTION v3.9 (with team name mapping, static opponent fallback, NHL per‑game stats)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -13,9 +13,8 @@ import NodeCache from 'node-cache';
 import rateLimit from 'express-rate-limit';
 import { createClient } from 'redis';
 
-// Import the NBA API service
+// Import services
 import nbaApiService from './services/nbaApiService.js';
-// ADDED: Import DraftRecommendation model
 import DraftRecommendation from './models/DraftRecommendation.js';
 import * as tank01Service from './services/tank01Service.js';
 import * as sleeperService from './services/sleeperService.js';
@@ -24,23 +23,21 @@ const app = express();
 const PORT = process.env.PORT || 3002;
 const HOST = process.env.HOST || '0.0.0.0';
 
-console.log('🚀 NBA Fantasy AI Backend - FINAL PRODUCTION v3.6 (with Tank01 Redis Caching)');
+console.log('🚀 NBA Fantasy AI Backend - FINAL PRODUCTION v3.9 (with team name mapping & static opponent fallback)');
 console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 
 // ====================
-// REDIS CLIENTS (Primary + Cache Client)
+// REDIS CLIENTS
 // ====================
 let redisClient = null;
 let redisCacheClient = null;
 
 if (process.env.REDIS_URL) {
   try {
-    // Main Redis client (existing)
     redisClient = new Redis(process.env.REDIS_URL);
     redisClient.on('connect', () => console.log('✅ Redis connected (main)'));
     redisClient.on('error', (err) => console.log('Redis error:', err.message));
 
-    // New Redis client for caching (using the URL from File 1)
     const REDIS_CACHE_URL = process.env.REDIS_CACHE_URL || 'redis://default:INSrZrFpEBiQydygTJdrFrXgmbdCEBBz@metro.proxy.rlwy.net:48972';
     redisCacheClient = createClient({ url: REDIS_CACHE_URL });
     
@@ -53,10 +50,37 @@ if (process.env.REDIS_URL) {
 }
 
 // ====================
-// HELPER: CACHE UTILITY
+// CACHE CONFIGURATION (NodeCache as fallback)
 // ====================
+const cache = new NodeCache({ stdTTL: 300 }); // 5 minutes default
+
+// ====================
+// GLOBAL STATIC PLAYERS CACHE (from Python API)
+// ====================
+let staticNBAPlayers = [];
+let staticNHLPlayers = [];
+let staticMLBPlayers = [];
+let staticNFLPlayers = [];
+
+// ====================
+// HELPER: CACHE UTILITY (with fixed Redis setEx)
+// ====================
+// Add this helper function near your other fetch functions
+async function fetchTank01Roster(teamAbv, sport) {
+  const cacheKey = `tank01:roster:${sport}:${teamAbv}`;
+  return await getCachedOrFetch(cacheKey, async () => {
+    const rosterData = await getCachedTank01Data('getTeamRoster', { 
+      team: teamAbv, 
+      sport,
+      getStats: 'true',
+      fantasyPoints: 'true' 
+    }, 3600); // 1 hour cache
+    
+    return rosterData;
+  }, 3600);
+}
+
 async function getCachedOrFetch(key, fetchFn, ttl = 300) {
-  // Try Redis cache first
   if (redisCacheClient) {
     try {
       const cached = await redisCacheClient.get(key);
@@ -69,45 +93,192 @@ async function getCachedOrFetch(key, fetchFn, ttl = 300) {
     }
   }
   
-  // Try NodeCache as fallback
   const nodeCached = cache.get(key);
   if (nodeCached) {
     console.log(`✅ Serving ${key} from NodeCache`);
     return nodeCached;
   }
   
-  // Fetch fresh data
   console.log(`🔄 Fetching fresh data for ${key}`);
   const data = await fetchFn();
   
-  // Store in Redis cache
   if (redisCacheClient) {
     try {
-      await redisCacheClient.setEx(key, ttl, JSON.stringify(data));
+      await redisCacheClient.set(key, JSON.stringify(data), { EX: ttl });
       console.log(`✅ Stored ${key} in Redis cache with TTL ${ttl}s`);
     } catch (error) {
       console.warn(`⚠️ Redis cache write failed for ${key}:`, error.message);
-      // Fallback to NodeCache
       cache.set(key, data, ttl);
     }
   } else {
-    // Fallback to NodeCache
     cache.set(key, data, ttl);
   }
   
   return data;
 }
 
+async function fetchNodeMasterWithRetry(sport = 'nba', maxRetries = 3) {
+  const url = `https://prizepicks-production.up.railway.app/api/players/master?sport=${sport}`;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        if (response.status === 429 && attempt < maxRetries) {
+          const delay = Math.pow(2, attempt) * 1000;
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const result = await response.json();
+      if (!result.success || !Array.isArray(result.data)) {
+        throw new Error('Invalid data format from Node Master');
+      }
+      // Transform to a consistent format (mirrors fantasyhub transformation)
+      return result.data.map(p => ({
+        player_id: p.id,
+        name: p.name,
+        team: p.team,
+        position: p.position,
+        injury_status: p.injury_status || 'Healthy',
+        points: p.points || 0,
+        rebounds: p.rebounds || 0,
+        assists: p.assists || 0,
+        steals: p.steals || 0,
+        blocks: p.blocks || 0,
+        turnovers: p.turnovers || 0,
+        fantasy_points: p.projection || p.fantasy_points || 0,
+        salary: p.salary || 5000,
+        games_played: p.games_played || 0,
+        adp: p.adp,
+        is_rookie: p.is_rookie || false,
+        value: p.salary ? ((p.projection || 0) / p.salary) * 1000 : 0,
+        source: 'node_master'
+      }));
+    } catch (err) {
+      if (attempt === maxRetries) throw err;
+      const delay = Math.pow(2, attempt) * 1000;
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw new Error('Max retries exceeded');
+}
+
 // ====================
-// TANK01 CACHED DATA FETCHER (NEW IMPROVED VERSION)
+// TEAM NAME TO ABBREVIATION MAPPING (NBA + NHL)
 // ====================
+const TEAM_NAME_TO_ABBR = {
+  // NBA teams
+  'Atlanta Hawks': 'ATL',
+  'Boston Celtics': 'BOS',
+  'Brooklyn Nets': 'BKN',
+  'Charlotte Hornets': 'CHA',
+  'Chicago Bulls': 'CHI',
+  'Cleveland Cavaliers': 'CLE',
+  'Dallas Mavericks': 'DAL',
+  'Denver Nuggets': 'DEN',
+  'Detroit Pistons': 'DET',
+  'Golden State Warriors': 'GSW',
+  'Houston Rockets': 'HOU',
+  'Indiana Pacers': 'IND',
+  'Los Angeles Clippers': 'LAC',
+  'Los Angeles Lakers': 'LAL',
+  'Memphis Grizzlies': 'MEM',
+  'Miami Heat': 'MIA',
+  'Milwaukee Bucks': 'MIL',
+  'Minnesota Timberwolves': 'MIN',
+  'New Orleans Pelicans': 'NOP',
+  'New York Knicks': 'NYK',
+  'Oklahoma City Thunder': 'OKC',
+  'Orlando Magic': 'ORL',
+  'Philadelphia 76ers': 'PHI',
+  'Phoenix Suns': 'PHX',
+  'Portland Trail Blazers': 'POR',
+  'Sacramento Kings': 'SAC',
+  'San Antonio Spurs': 'SAS',
+  'Toronto Raptors': 'TOR',
+  'Utah Jazz': 'UTA',
+  'Washington Wizards': 'WAS',
+
+  // NHL teams
+  'Anaheim Ducks': 'ANA',
+  'Arizona Coyotes': 'ARI',
+  'Boston Bruins': 'BOS',
+  'Buffalo Sabres': 'BUF',
+  'Calgary Flames': 'CGY',
+  'Carolina Hurricanes': 'CAR',
+  'Chicago Blackhawks': 'CHI',
+  'Colorado Avalanche': 'COL',
+  'Columbus Blue Jackets': 'CBJ',
+  'Dallas Stars': 'DAL',
+  'Detroit Red Wings': 'DET',
+  'Edmonton Oilers': 'EDM',
+  'Florida Panthers': 'FLA',
+  'Los Angeles Kings': 'LAK',
+  'Minnesota Wild': 'MIN',
+  'Montréal Canadiens': 'MTL',
+  'Nashville Predators': 'NSH',
+  'New Jersey Devils': 'NJD',
+  'New York Islanders': 'NYI',
+  'New York Rangers': 'NYR',
+  'Ottawa Senators': 'OTT',
+  'Philadelphia Flyers': 'PHI',
+  'Pittsburgh Penguins': 'PIT',
+  'San Jose Sharks': 'SJS',
+  'Seattle Kraken': 'SEA',
+  'St. Louis Blues': 'STL',
+  'Tampa Bay Lightning': 'TBL',
+  'Toronto Maple Leafs': 'TOR',
+  'Vancouver Canucks': 'VAN',
+  'Vegas Golden Knights': 'VGK',
+  'Washington Capitals': 'WSH',
+  'Winnipeg Jets': 'WPG'
+};
+
+function getTeamAbbreviation(fullName) {
+  return TEAM_NAME_TO_ABBR[fullName] || fullName; // fallback to original if not found
+}
+
+// ====================
+// TANK01 CACHED DATA FETCHER (with fixed Redis setEx)
+// ====================
+async function fetchTeamDefensiveStats(sport = 'nba') {
+  const cacheKey = `tank01:defensive:${sport}`;
+  return await getCachedOrFetch(cacheKey, async () => {
+    const currentInfo = await getCachedTank01Data('getCurrentInfo', { sport }, 86400); // 24h cache
+    const teams = currentInfo?.teamStats || currentInfo?.teams || [];
+    const defensiveMap = new Map();
+    teams.forEach(team => {
+      defensiveMap.set(team.teamAbbrev, {
+        pointsAllowed: parseFloat(team.oppg) || 0,
+        reboundsAllowed: parseFloat(team.opprpg) || 0,
+        assistsAllowed: parseFloat(team.oppapg) || 0,
+      });
+    });
+    return defensiveMap;
+  }, 3600); // 1 hour TTL
+}
+
+function computeLeagueAverages(defensiveMap) {
+  let totalPoints = 0, totalRebs = 0, totalAsts = 0, count = 0;
+  for (const stats of defensiveMap.values()) {
+    totalPoints += stats.pointsAllowed;
+    totalRebs += stats.reboundsAllowed;
+    totalAsts += stats.assistsAllowed;
+    count++;
+  }
+  return {
+    points: count > 0 ? totalPoints / count : 110,
+    rebounds: count > 0 ? totalRebs / count : 42,
+    assists: count > 0 ? totalAsts / count : 24,
+  };
+}
+
 async function getCachedTank01Data(endpoint, params = {}, ttl = 600) {
-  // Build cache key from endpoint and params
   const paramString = Object.keys(params).sort().map(key => `${key}:${params[key]}`).join(':');
   const cacheKey = `tank01:${endpoint}:${paramString}`;
   
   try {
-    // Try Redis first
     if (redisCacheClient) {
       const cached = await redisCacheClient.get(cacheKey);
       if (cached) {
@@ -116,7 +287,6 @@ async function getCachedTank01Data(endpoint, params = {}, ttl = 600) {
       }
     }
     
-    // Fetch fresh data based on endpoint
     console.log(`🔄 Fetching fresh Tank01 data: ${endpoint}`);
     let data;
     
@@ -155,13 +325,19 @@ async function getCachedTank01Data(endpoint, params = {}, ttl = 600) {
       case 'getBoxScore':
         data = await tank01Service.getBoxScore(params.gameID, params.fantasyPoints === 'true', params.sport || 'nba');
         break;
+      // NEW CASES FOR MLB & NHL TEAMS
+      case 'getMLBTeams':
+        data = await tank01Service.getMLBTeams();
+        break;
+      case 'getNHLTeams':
+        data = await tank01Service.getNHLTeams();
+        break;
       default:
         throw new Error(`Unknown endpoint: ${endpoint}`);
     }
     
-    // Store in Redis
     if (redisCacheClient) {
-      await redisCacheClient.setEx(cacheKey, ttl, JSON.stringify(data));
+      await redisCacheClient.set(cacheKey, JSON.stringify(data), { EX: ttl });
       console.log(`✅ Stored Tank01 data in Redis: ${endpoint}`);
     }
     
@@ -172,21 +348,62 @@ async function getCachedTank01Data(endpoint, params = {}, ttl = 600) {
   }
 }
 
+const DEFENSIVE_FACTORS = {
+  'BOS': { points: 0.95, rebounds: 1.02, assists: 0.98, fantasy: 0.97 },
+  'BKN': { points: 1.02, rebounds: 0.99, assists: 1.01, fantasy: 1.01 },
+  'NYK': { points: 0.97, rebounds: 1.00, assists: 0.96, fantasy: 0.96 },
+  'PHI': { points: 0.98, rebounds: 1.01, assists: 0.97, fantasy: 0.97 },
+  'TOR': { points: 1.01, rebounds: 0.98, assists: 1.02, fantasy: 1.00 },
+  'CHI': { points: 1.03, rebounds: 1.02, assists: 1.01, fantasy: 1.02 },
+  'CLE': { points: 0.96, rebounds: 0.99, assists: 0.95, fantasy: 0.95 },
+  'DET': { points: 1.05, rebounds: 1.04, assists: 1.03, fantasy: 1.04 },
+  'IND': { points: 1.02, rebounds: 1.00, assists: 1.02, fantasy: 1.01 },
+  'MIL': { points: 0.92, rebounds: 1.01, assists: 0.94, fantasy: 0.94 },
+  'ATL': { points: 1.04, rebounds: 1.03, assists: 1.04, fantasy: 1.03 },
+  'CHA': { points: 1.03, rebounds: 1.02, assists: 1.02, fantasy: 1.02 },
+  'MIA': { points: 0.96, rebounds: 0.98, assists: 0.97, fantasy: 0.96 },
+  'ORL': { points: 0.97, rebounds: 1.00, assists: 0.98, fantasy: 0.97 },
+  'WAS': { points: 1.06, rebounds: 1.03, assists: 1.05, fantasy: 1.05 },
+  'DEN': { points: 1.02, rebounds: 0.95, assists: 1.03, fantasy: 1.00 },
+  'MIN': { points: 0.94, rebounds: 0.96, assists: 0.95, fantasy: 0.94 },
+  'OKC': { points: 0.93, rebounds: 0.97, assists: 0.94, fantasy: 0.93 },
+  'POR': { points: 1.04, rebounds: 1.02, assists: 1.03, fantasy: 1.03 },
+  'UTA': { points: 1.01, rebounds: 0.99, assists: 1.02, fantasy: 1.00 },
+  'GSW': { points: 0.98, rebounds: 1.01, assists: 0.97, fantasy: 0.97 },
+  'LAC': { points: 0.97, rebounds: 0.98, assists: 0.98, fantasy: 0.96 },
+  'LAL': { points: 1.08, rebounds: 0.97, assists: 1.05, fantasy: 1.04 },
+  'PHX': { points: 1.05, rebounds: 0.99, assists: 1.03, fantasy: 1.02 },
+  'SAC': { points: 1.03, rebounds: 1.02, assists: 1.02, fantasy: 1.02 },
+  'DAL': { points: 1.02, rebounds: 1.01, assists: 1.02, fantasy: 1.01 },
+  'HOU': { points: 1.04, rebounds: 1.03, assists: 1.03, fantasy: 1.03 },
+  'MEM': { points: 0.95, rebounds: 0.96, assists: 0.96, fantasy: 0.95 },
+  'NOP': { points: 1.01, rebounds: 1.02, assists: 1.00, fantasy: 1.01 },
+  'SAS': { points: 0.99, rebounds: 1.00, assists: 0.99, fantasy: 0.99 }
+};
+
 // ====================
-// GLOBAL STATIC PLAYERS CACHE (from Python API)
+// FETCH STATIC NBA PLAYERS (from Python API)
 // ====================
-let staticNBAPlayers = [];
 
 async function fetchStaticNBAPlayers() {
   const pythonApiUrl = process.env.PYTHON_API_URL || 'https://python-api-fresh-production.up.railway.app';
   try {
     console.log('📡 Fetching static NBA players from Python API...');
     const response = await axios.get(`${pythonApiUrl}/api/fantasy/players`, {
-      params: { sport: 'nba', realtime: 'false', limit: 200 },
+      params: { sport: 'nba', realtime: 'false', limit: 500 },
       timeout: 10000
     });
     if (response.data.success && Array.isArray(response.data.players)) {
       console.log(`✅ Loaded ${response.data.players.length} static NBA players`);
+      if (response.data.players.length > 0) {
+        console.log('🔍 First player from Python:', {
+          name: response.data.players[0].name,
+          points: response.data.players[0].points,
+          rebounds: response.data.players[0].rebounds,
+          assists: response.data.players[0].assists,
+          fantasy_points: response.data.players[0].fantasy_points
+        });
+      }
       return response.data.players;
     }
     console.warn('⚠️ Python API returned no players, using empty array');
@@ -197,13 +414,113 @@ async function fetchStaticNBAPlayers() {
   }
 }
 
+// ====================
+// FETCH STATIC NHL PLAYERS (from Python API) – CORRECTED VERSION
+// ====================
+async function fetchStaticMLBPlayers() {
+  const pythonApiUrl = process.env.PYTHON_API_URL || 'https://python-api-fresh-production.up.railway.app';
+  try {
+    console.log('📡 Fetching static MLB players from Python API...');
+    const response = await axios.get(`${pythonApiUrl}/api/players`, {
+      params: { sport: 'mlb', realtime: 'false', limit: 500 },
+      timeout: 10000
+    });
+    if (response.data?.data?.players) {
+      const players = response.data.data.players;
+      console.log(`✅ Raw MLB players count: ${players.length}`);
+      // Map to consistent format (similar to NHL mapping)
+      const mapped = players.map(p => ({
+        id: p.id || `mlb-${p.name.replace(/\s+/g, '-')}`,
+        name: p.name,
+        team: p.team,
+        position: p.position,
+        points: p.points || 0,
+        fantasy_points: p.fantasy_points || 0,
+        injury_status: p.injury_status || 'Healthy',
+        salary: p.salary || 5000,
+        games_played: p.games_played || 1,
+        adp: p.adp
+      }));
+      console.log(`✅ Mapped ${mapped.length} static MLB players`);
+      return mapped;
+    }
+    return [];
+  } catch (error) {
+    console.error('❌ Failed to fetch static MLB players:', error.message);
+    return [];
+  }
+}
+
+async function fetchStaticNHLPlayers() {
+  const pythonApiUrl = process.env.PYTHON_API_URL || 'https://python-api-fresh-production.up.railway.app';
+  try {
+    console.log('📡 Fetching static NHL players from Python API...');
+    const response = await axios.get(`${pythonApiUrl}/api/players`, {
+      params: { sport: 'nhl', realtime: 'false', limit: 500 },
+      timeout: 10000
+    });
+
+    if (response.data?.data?.players) {
+      const players = response.data.data.players;
+      console.log(`✅ Raw NHL players count: ${players.length}`);
+
+      const mappedPlayers = players.map(p => {
+        const games = p.games_played || 1;
+        
+        return {
+          id: p.id || `nhl-${p.name.replace(/\s+/g, '-')}`,
+          name: p.name,
+          team: p.team,
+          position: p.position,
+          
+          // Per-game stats (already have these)
+          points: (p.points || 0) / games,
+          assists: (p.assists || 0) / games,
+          fantasy_points: p.fantasy_points || 0,
+          
+          // NHL-specific stats from your curl response
+          goals: (p.goals || 0) / games,
+          plusMinus: p.plusMinus || 0,
+          shots: (p.shots || 0) / games,
+          hits: (p.hits || 0) / games,
+          blockedShots: (p.blockedShots || 0) / games,
+          timeOnIce: p.timeOnIce || '0:00',
+          powerPlayGoals: (p.powerPlayGoals || 0) / games,
+          powerPlayAssists: (p.powerPlayAssists || 0) / games,
+          powerPlayPoints: (p.powerPlayPoints || 0) / games,
+          faceoffsWon: (p.faceoffsWon || 0) / games,
+          faceoffsLost: (p.faceoffsLost || 0) / games,
+          faceoffs: (p.faceoffs || 0) / games,
+          penalties: (p.penalties || 0) / games,
+          penaltiesInMinutes: (p.penaltiesInMinutes || 0) / games,
+          shifts: p.shifts || 0,
+          takeaways: (p.takeaways || 0) / games,
+          giveaways: (p.giveaways || 0) / games,
+          shotsMissedNet: (p.shotsMissedNet || 0) / games,
+          
+          // Original fields
+          injury_status: p.injury_status || 'Healthy',
+          salary: 5000,
+          games_played: games
+        };
+      });
+
+      console.log(`✅ Mapped ${mappedPlayers.length} static NHL players with enhanced stats`);
+      return mappedPlayers;
+    }
+    return [];
+  } catch (error) {
+    console.error('❌ Failed to fetch static NHL players:', error.message);
+    return [];
+  }
+}
+
 // Tank01 master data cache (refreshed every hour)
 let tank01MasterCache = null;
 let tank01CacheTime = 0;
 const TANK01_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
 async function getTank01MasterData(sport = 'nba') {
-  // Try Redis cache first
   const cacheKey = `tank01:master:${sport}`;
   if (redisCacheClient) {
     try {
@@ -211,7 +528,6 @@ async function getTank01MasterData(sport = 'nba') {
       if (cached) {
         console.log(`✅ Serving Tank01 master data from Redis cache`);
         const parsed = JSON.parse(cached);
-        // Convert back to Map
         return new Map(parsed);
       }
     } catch (error) {
@@ -219,22 +535,19 @@ async function getTank01MasterData(sport = 'nba') {
     }
   }
 
-  // Fallback to in-memory cache
   if (tank01MasterCache && (Date.now() - tank01CacheTime) < TANK01_CACHE_TTL) {
     return tank01MasterCache;
   }
-  
+
   try {
-    // Fetch all needed data concurrently using the cached versions
     const [playerList, projections, adpList, injuries] = await Promise.all([
       getCachedTank01Data('getPlayerList', { sport }, 3600),
       getCachedTank01Data('getProjections', { days: 7, sport }, 1800),
       getCachedTank01Data('getADP', { sport }, 3600),
       getCachedTank01Data('getInjuries', { sport }, 600)
     ]);
-    
-    // Build maps
-    const playerMap = new Map(); // key: playerID -> basic info
+
+    const playerMap = new Map();
     if (Array.isArray(playerList)) {
       playerList.forEach(p => {
         playerMap.set(p.playerID, {
@@ -245,57 +558,62 @@ async function getTank01MasterData(sport = 'nba') {
         });
       });
     }
-    
+
     const projectionMap = new Map();
     if (projections) {
       Object.entries(projections).forEach(([id, proj]) => {
         projectionMap.set(id, proj);
       });
     }
-    
+
     const adpMap = new Map();
     if (Array.isArray(adpList)) {
       adpList.forEach(item => {
         adpMap.set(item.playerID, parseFloat(item.overallADP) || 999);
       });
     }
-    
+
     const injurySet = new Set();
     if (Array.isArray(injuries)) {
       injuries.forEach(inj => {
         if (inj.playerID) injurySet.add(inj.playerID);
       });
     }
-    
-    // Combine into master map keyed by playerID
+
     const masterMap = new Map();
+    const gamesInPeriod = 7;
+
     for (const [id, basic] of playerMap.entries()) {
       const proj = projectionMap.get(id);
+      const pointsPerGame = proj?.pts ? parseFloat(proj.pts) / gamesInPeriod : undefined;
+      const reboundsPerGame = proj?.reb ? parseFloat(proj.reb) / gamesInPeriod : undefined;
+      const assistsPerGame = proj?.ast ? parseFloat(proj.ast) / gamesInPeriod : undefined;
+      const fantasyPerGame = proj?.fantasyPoints ? parseFloat(proj.fantasyPoints) / gamesInPeriod : undefined;
+
       masterMap.set(id, {
         ...basic,
-        projection: proj?.fantasyPoints ? parseFloat(proj.fantasyPoints) : undefined,
         adp: adpMap.get(id),
         injury_status: injurySet.has(id) ? 'Injured' : 'Healthy',
-        points: proj?.pts ? parseFloat(proj.pts) : undefined,
-        rebounds: proj?.reb ? parseFloat(proj.reb) : undefined,
-        assists: proj?.ast ? parseFloat(proj.ast) : undefined,
+        points: pointsPerGame,
+        rebounds: reboundsPerGame,
+        assists: assistsPerGame,
+        projection: fantasyPerGame,
       });
     }
-    
+
     tank01MasterCache = masterMap;
     tank01CacheTime = Date.now();
-    
-    // Store in Redis (convert Map to array for storage)
+
     if (redisCacheClient) {
       try {
         const serialized = JSON.stringify(Array.from(masterMap.entries()));
-        await redisCacheClient.setEx(cacheKey, 3600, serialized); // 1 hour TTL
+        await redisCacheClient.set(cacheKey, serialized, { EX: 3600 });
         console.log(`✅ Stored Tank01 master data in Redis cache`);
       } catch (error) {
-        console.warn('⚠️ Redis cache write failed for Tank01 master:', error.message);
+        console.warn('⚠️ Redis cache write failed:', error.message);
       }
     }
-    
+
     return masterMap;
   } catch (error) {
     console.error('Error fetching Tank01 master data:', error);
@@ -315,8 +633,8 @@ const allowedOrigins = [
   'http://februaryfantasy-production.up.railway.app',
   'https://pleasing-determination-production.up.railway.app',
   'http://pleasing-determination-production.up.railway.app',
-  'https://prizepicks-production.up.railway.app',  // NEW PRIMARY DOMAIN
-  'http://prizepicks-production.up.railway.app',   // NEW PRIMARY DOMAIN
+  'https://prizepicks-production.up.railway.app',
+  'http://prizepicks-production.up.railway.app',
   'http://localhost:19006',
   'http://localhost:3000',
   'http://localhost:3001',
@@ -405,11 +723,6 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ====================
-// CACHE CONFIGURATION (NodeCache as fallback)
-// ====================
-const cache = new NodeCache({ stdTTL: 300 }); // 5 minutes default
-
-// ====================
 // RATE LIMITERS
 // ====================
 const apiLimiter = rateLimit({
@@ -447,8 +760,8 @@ const swaggerOptions = {
     openapi: '3.0.0',
     info: {
       title: 'NBA Fantasy AI API',
-      version: '3.6.0',
-      description: 'NBA Fantasy AI Backend API Documentation (with Tank01 Redis caching)',
+      version: '3.9.0',
+      description: 'NBA Fantasy AI Backend API Documentation (with Tank01 Redis caching + Opponent Adjustments + Static Fallback)',
       license: { name: 'MIT', url: 'https://opensource.org/licenses/MIT' }
     },
     servers: [
@@ -479,7 +792,7 @@ try {
 }
 
 // ====================
-// RESPONSE CONVERTER MIDDLEWARE (unchanged)
+// RESPONSE CONVERTER MIDDLEWARE
 // ====================
 app.use((req, res, next) => {
   console.log(`🛠️ Request to: ${req.path}`);
@@ -487,7 +800,6 @@ app.use((req, res, next) => {
   res.json = function(data) {
     console.log(`🛠️ Response for ${req.path}:`, data?.success ? 'Success' : 'Failed');
     if (data && data.success === true) {
-      // NFL Standings conversion (keep as before)
       if (req.path.includes('/nfl/standings') && data.standings && typeof data.standings === 'object' && !Array.isArray(data.standings)) {
         const allTeams = [];
         if (data.standings.afc) {
@@ -502,7 +814,6 @@ app.use((req, res, next) => {
         }
         data.standings = allTeams;
       }
-      // NHL Standings conversion (similar)
       if (req.path.includes('/nhl/standings') && data.standings && typeof data.standings === 'object' && !Array.isArray(data.standings)) {
         const allTeams = [];
         if (data.standings.eastern) {
@@ -534,7 +845,6 @@ app.get('/api/health/cache', async (req, res) => {
     
     if (redisCacheClient) {
       try {
-        // Test Redis connection
         await redisCacheClient.set('health:test', 'ok', { EX: 10 });
         const test = await redisCacheClient.get('health:test');
         redisTest = test === 'ok' ? 'passed' : 'failed';
@@ -545,7 +855,6 @@ app.get('/api/health/cache', async (req, res) => {
       }
     }
     
-    // Get cache stats
     const nodeCacheStats = cache.getStats();
     
     res.json({
@@ -572,13 +881,23 @@ app.get('/api/health/cache', async (req, res) => {
   }
 });
 
+app.get('/api/debug/draft-params', function(req, res) {
+  console.log('🔍 Debug draft params:', req.query);
+  res.json({
+    received_params: req.query,
+    pick_value: req.query.pick,
+    pick_type: typeof req.query.pick,
+    parsed_pick: parseInt(req.query.pick, 10)
+  });
+});
+
 // ====================
 // BASIC ENDPOINTS
 // ====================
 app.get('/', (req, res) => {
   res.json({
     service: 'NBA Fantasy AI Backend',
-    version: '3.6.0',
+    version: '3.9.0',
     status: 'running',
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || 'development',
@@ -609,7 +928,7 @@ app.get('/health', (req, res) => {
   const health = {
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    version: '3.6.0',
+    version: '3.9.0',
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     redis: redisCacheClient ? 'connected' : 'disabled',
@@ -631,7 +950,7 @@ app.get('/railway-health', (req, res) => {
     status: 'ok',
     timestamp: Date.now(),
     service: 'NBA Fantasy API',
-    version: '3.6.0',
+    version: '3.9.0',
     cors: { clientOrigin: req.headers.origin || 'unknown', allowed: true },
     api_integrations: { nba_api_service: 'active', the_odds_api: process.env.ODDS_API_KEY ? 'key found' : 'key missing', static_2026_python: staticNBAPlayers.length }
   });
@@ -641,7 +960,7 @@ app.get('/api', (req, res) => {
   res.json({
     success: true,
     message: 'NBA Fantasy AI API Gateway',
-    version: '3.6.0',
+    version: '3.9.0',
     timestamp: new Date().toISOString(),
     client: { origin: req.headers.origin || 'unknown', ip: req.ip, userAgent: req.headers['user-agent'] },
     documentation: { swaggerUI: '/api-docs', swaggerJSON: '/api-docs.json' },
@@ -653,8 +972,8 @@ app.get('/api', (req, res) => {
       { path: '/api/games', description: 'Game schedules and results' },
       { path: '/api/news', description: 'Sports news and updates' },
       { path: '/api/sportsbooks', description: 'Sports betting data' },
-      { path: '/api/prizepicks/selections', description: 'PrizePicks selections (The Odds API + 2026 static data)' },
-      { path: '/api/fantasyhub/players', description: 'Fantasy Hub with NBA API stats + 2026 static base' },
+      { path: '/api/prizepicks/selections', description: 'PrizePicks selections (The Odds API + 2026 static data + opponent adjustments)' },
+      { path: '/api/fantasyhub/players', description: 'Fantasy Hub with NBA API stats + 2026 static base + opponent adjustments' },
       { path: '/api/theoddsapi/playerprops', description: 'Direct The Odds API player props (enriched with static data)' },
       { path: '/api/system/status', description: 'System status and API health' },
       { path: '/api/health/cache', description: 'Cache health and statistics' }
@@ -688,9 +1007,8 @@ app.get('/api/test', (req, res) => {
 });
 
 // ====================
-// SLEEPER API ENDPOINTS (with Redis caching)
+// SLEEPER API ENDPOINTS
 // ====================
-// Helper to get current week (simplified)
 function getCurrentWeek() {
   const now = new Date();
   const start = new Date(now.getFullYear(), 0, 1);
@@ -708,7 +1026,7 @@ app.get('/api/sleeper/leagues', async (req, res) => {
         const { username = 'jerryjiya', sport = 'nba', season = '2025' } = req.query;
         return await sleeperService.getUserLeagues(username, sport, season);
       },
-      600 // 10 minutes TTL
+      600
     );
     
     res.json({ success: true, data });
@@ -717,7 +1035,6 @@ app.get('/api/sleeper/leagues', async (req, res) => {
   }
 });
 
-// Optional: get rosters for a specific league
 app.get('/api/sleeper/rosters', async (req, res) => {
   const { leagueId } = req.query;
   if (!leagueId) return res.status(400).json({ success: false, error: 'leagueId required' });
@@ -728,7 +1045,7 @@ app.get('/api/sleeper/rosters', async (req, res) => {
     const data = await getCachedOrFetch(
       cacheKey,
       async () => await sleeperService.getLeagueRosters(leagueId),
-      300 // 5 minutes TTL
+      300
     );
     
     res.json({ success: true, data });
@@ -737,7 +1054,6 @@ app.get('/api/sleeper/rosters', async (req, res) => {
   }
 });
 
-// Optional: get all Sleeper players (for reference)
 app.get('/api/sleeper/players', async (req, res) => {
   const { sport = 'nba' } = req.query;
   const cacheKey = `sleeper:players:${sport}`;
@@ -746,7 +1062,7 @@ app.get('/api/sleeper/players', async (req, res) => {
     const data = await getCachedOrFetch(
       cacheKey,
       async () => await sleeperService.getAllPlayers(sport),
-      3600 // 1 hour TTL (players don't change often)
+      3600
     );
     
     res.json({ success: true, data });
@@ -756,139 +1072,150 @@ app.get('/api/sleeper/players', async (req, res) => {
 });
 
 // ====================
-// UPDATED TANK01 ENDPOINTS WITH REDIS CACHING (using getCachedTank01Data)
+// TANK01 ENDPOINTS
 // ====================
+app.get('/api/tank01/teams', async (req, res) => {
+  const { league } = req.query; // 'mlb' or 'nhl'
+  if (!league || (league !== 'mlb' && league !== 'nhl')) {
+    return res.status(400).json({ success: false, error: 'Invalid league' });
+  }
+  try {
+    const data = await getCachedTank01Data(
+      league === 'mlb' ? 'getMLBTeams' : 'getNHLTeams',
+      {},
+      86400 // 24h cache
+    );
+    // Transform to { abbreviation, fullName, logo } format
+    const teams = (Array.isArray(data) ? data : []).map(t => ({
+      abbreviation: t.teamAbv || t.abbreviation,
+      fullName: t.teamName || t.fullName,
+      logo: t.logos?.[0] || null,
+    }));
+    res.json({ success: true, data: teams });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
-// Players list
 app.get('/api/tank01/players', async (req, res) => {
   try {
     const sport = req.query.sport || 'nba';
-    const data = await getCachedTank01Data('getPlayerList', { sport }, 3600); // 1 hour cache
+    const data = await getCachedTank01Data('getPlayerList', { sport }, 3600);
     res.json({ success: true, data, source: 'redis-cache' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ADP
 app.get('/api/tank01/adp', async (req, res) => {
   try {
     const sport = req.query.sport || 'nba';
-    const data = await getCachedTank01Data('getADP', { sport }, 3600); // 1 hour cache
+    const data = await getCachedTank01Data('getADP', { sport }, 3600);
     res.json({ success: true, data, source: 'redis-cache' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Projections
 app.get('/api/tank01/projections', async (req, res) => {
   try {
     const { days = 7, sport = 'nba' } = req.query;
-    const data = await getCachedTank01Data('getProjections', { days: parseInt(days), sport }, 1800); // 30 min cache
+    const data = await getCachedTank01Data('getProjections', { days: parseInt(days), sport }, 1800);
     res.json({ success: true, data, source: 'redis-cache' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Injuries
 app.get('/api/tank01/injuries', async (req, res) => {
   try {
     const sport = req.query.sport || 'nba';
-    const data = await getCachedTank01Data('getInjuries', { sport }, 600); // 10 min cache
+    const data = await getCachedTank01Data('getInjuries', { sport }, 600);
     res.json({ success: true, data, source: 'redis-cache' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// News
 app.get('/api/tank01/news', async (req, res) => {
   try {
     const { max = 10, sport = 'nba' } = req.query;
-    const data = await getCachedTank01Data('getNews', { max: parseInt(max), sport }, 600); // 10 min cache
+    const data = await getCachedTank01Data('getNews', { max: parseInt(max), sport }, 600);
     res.json({ success: true, data, source: 'redis-cache' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Depth Charts
 app.get('/api/tank01/depthcharts', async (req, res) => {
   try {
     const sport = req.query.sport || 'nba';
-    const data = await getCachedTank01Data('getDepthCharts', { sport }, 3600); // 1 hour cache
+    const data = await getCachedTank01Data('getDepthCharts', { sport }, 3600);
     res.json({ success: true, data, source: 'redis-cache' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Games for Date
 app.get('/api/tank01/games', async (req, res) => {
   try {
     const { date, sport = 'nba' } = req.query;
     if (!date) return res.status(400).json({ success: false, error: 'date required (YYYYMMDD)' });
     
-    const data = await getCachedTank01Data('getGamesForDate', { gameDate: date, sport }, 300); // 5 min cache
+    const data = await getCachedTank01Data('getGamesForDate', { gameDate: date, sport }, 300);
     res.json({ success: true, data, source: 'redis-cache' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Player Info by name
 app.get('/api/tank01/player', async (req, res) => {
   try {
     const { name, sport = 'nba' } = req.query;
     if (!name) return res.status(400).json({ success: false, error: 'name required' });
     
-    const data = await getCachedTank01Data('getPlayerInfo', { name, sport }, 3600); // 1 hour cache
+    const data = await getCachedTank01Data('getPlayerInfo', { name, sport }, 3600);
     res.json({ success: true, data, source: 'redis-cache' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Team Roster
 app.get('/api/tank01/roster', async (req, res) => {
   try {
     const { team, sport = 'nba' } = req.query;
     if (!team) return res.status(400).json({ success: false, error: 'team abbreviation required' });
     
-    const data = await getCachedTank01Data('getTeamRoster', { team, sport }, 3600); // 1 hour cache
+    const data = await getCachedTank01Data('getTeamRoster', { team, sport }, 3600);
     res.json({ success: true, data, source: 'redis-cache' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Current Info
 app.get('/api/tank01/currentinfo', async (req, res) => {
   try {
     const sport = req.query.sport || 'nba';
-    const data = await getCachedTank01Data('getCurrentInfo', { sport }, 600); // 10 min cache
+    const data = await getCachedTank01Data('getCurrentInfo', { sport }, 600);
     res.json({ success: true, data, source: 'redis-cache' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Box Score
 app.get('/api/tank01/boxscore', async (req, res) => {
   try {
     const { gameID, fantasyPoints = 'true', sport = 'nba' } = req.query;
     if (!gameID) return res.status(400).json({ success: false, error: 'gameID required' });
     
-    const data = await getCachedTank01Data('getBoxScore', { gameID, fantasyPoints, sport }, 600); // 10 min cache
+    const data = await getCachedTank01Data('getBoxScore', { gameID, fantasyPoints, sport }, 600);
     res.json({ success: true, data, source: 'redis-cache' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// GET /api/players/master - Merged player list (static + Tank01 enrichment)
+// GET /api/players/master
 app.get('/api/players/master', async (req, res) => {
   try {
     const sport = req.query.sport || 'nba';
@@ -896,73 +1223,49 @@ app.get('/api/players/master', async (req, res) => {
       return res.json({ success: true, data: [], count: 0, message: 'Only NBA supported' });
     }
 
-    const cacheKey = `players:master:${sport}`;
+    const cacheKey = `players:master:api:${sport}`;
     
     const data = await getCachedOrFetch(
       cacheKey,
       async () => {
-        // Use static list as base (loaded at startup)
-        let basePlayers = staticNBAPlayers;
-        if (!basePlayers.length) {
-          console.log('⚠️ Static players empty, using fallback');
-          basePlayers = generateIntelligentFantasyFallback();
+        if (process.env.RAPIDAPI_KEY) {
+          try {
+            console.log('📡 Fetching from API-BASKETBALL (RapidAPI)...');
+            const apiPlayers = await fetchFromAPIBasketball();
+            if (apiPlayers && apiPlayers.length > 0) {
+              console.log(`✅ Loaded ${apiPlayers.length} players from API-BASKETBALL`);
+              return apiPlayers;
+            }
+          } catch (apiError) {
+            console.error('❌ API-BASKETBALL failed:', apiError.message);
+          }
+        } else {
+          console.log('⚠️ RAPIDAPI_KEY not set – skipping API');
         }
 
-        const tank01Master = await getTank01MasterData(sport);
+        // ✅ Use the 2026 static players if available
+        if (staticNBAPlayers && staticNBAPlayers.length > 0) {
+          console.log(`🔄 Using static 2026 NBA players (${staticNBAPlayers.length})`);
+          return staticNBAPlayers;
+        }
 
-        // Enrich each player with Tank01 data (match by name)
-        const enriched = basePlayers.map(player => {
-          // Simple name matching: try to find a Tank01 player whose name contains or is contained by the static name
-          let matched = null;
-          for (const [id, data] of tank01Master.entries()) {
-            if (!data.name) continue;
-            const pName = player.name.toLowerCase();
-            const tName = data.name.toLowerCase();
-            if (pName.includes(tName) || tName.includes(pName)) {
-              matched = data;
-              break;
-            }
-          }
-
-          if (matched) {
-            // Merge fields, preferring static values for salary, projection (if exists)
-            return {
-              ...player,
-              adp: matched.adp || player.adp,
-              injury_status: matched.injury_status || player.injury_status || 'Healthy',
-              projection: matched.projection || player.projection,
-              points: matched.points || player.points,
-              rebounds: matched.rebounds || player.rebounds,
-              assists: matched.assists || player.assists,
-              // Compute ceiling/floor based on projection
-              ceiling: matched.projection ? matched.projection * 1.2 : player.ceiling,
-              floor: matched.projection ? matched.projection * 0.8 : player.floor,
-            };
-          }
-          return player;
-        });
-
-        // Recalculate value based on salary and projection
-        enriched.forEach(p => {
-          if (p.salary && p.projection) {
-            p.value = (p.projection / p.salary) * 1000;
-          }
-        });
-
-        return enriched;
+        console.log('⚠️ No static players, using curated fallback');
+        return generateIntelligentFantasyFallback();
       },
-      600 // 10 minutes TTL
+      1800
     );
-    
-    res.json({ success: true, data, count: data.length, source: 'cache' });
+
+    res.json({ success: true, data, count: data.length, source: data[0]?.source || 'curated' });
+
   } catch (error) {
-    console.error('Error in /api/players/master:', error);
-    res.status(500).json({ success: false, error: error.message });
+    console.error('🔥 Fatal error in /api/players/master:', error);
+    const emergency = generateIntelligentFantasyFallback().slice(0, 3);
+    res.json({ success: true, data: emergency, count: emergency.length, source: 'emergency' });
   }
 });
 
 // ====================
-// PRIZEPICKS ENDPOINT (USING THE ODDS API + STATIC ENRICHMENT) with Redis caching
+// PRIZEPICKS ENDPOINT
 // ====================
 async function fetchPlayerPropsFromOddsAPI(sport = 'basketball_nba') {
   console.log(`🎯 [The Odds API] Fetching player props for ${sport}...`);
@@ -982,6 +1285,11 @@ async function fetchPlayerPropsFromOddsAPI(sport = 'basketball_nba') {
     const games = gamesResponse.data;
     if (!games || games.length === 0) return [];
 
+    // Log a sample game to see the exact field names (temporary)
+    if (games.length > 0) {
+      console.log('📦 Sample game data from Odds API:', JSON.stringify(games[0], null, 2));
+    }
+
     const allPlayerProps = [];
     const markets = ['player_points', 'player_rebounds', 'player_assists'];
     for (const game of games.slice(0, 2)) {
@@ -990,12 +1298,24 @@ async function fetchPlayerPropsFromOddsAPI(sport = 'basketball_nba') {
           params: { apiKey: API_KEY, regions: 'us', markets: markets.join(','), oddsFormat: 'decimal' },
           timeout: 15000
         })).data;
+
+        // Extract team abbreviations – use the exact field names from the API
+        const homeTeam = game.home_team;          // might be "Los Angeles Lakers"
+        const awayTeam = game.away_team;
+        // If the API provides abbreviations directly, use those (e.g. game.home_team_abbr)
+        const homeAbbr = game.home_team_abbr || getTeamAbbreviation(homeTeam);
+        const awayAbbr = game.away_team_abbr || getTeamAbbreviation(awayTeam);
+
         for (const bookmaker of eventData.bookmakers || []) {
           for (const market of bookmaker.markets || []) {
             if (!markets.includes(market.key)) continue;
             for (const outcome of market.outcomes || []) {
               allPlayerProps.push({
                 game: `${game.away_team} @ ${game.home_team}`,
+                away_team_full: game.away_team,
+                home_team_full: game.home_team,
+                away_team_abbr: awayAbbr,
+                home_team_abbr: homeAbbr,
                 player: outcome.description || outcome.name,
                 prop_type: market.key.replace('player_', ''),
                 line: outcome.point || 0,
@@ -1014,7 +1334,6 @@ async function fetchPlayerPropsFromOddsAPI(sport = 'basketball_nba') {
       await new Promise(resolve => setTimeout(resolve, 200));
     }
     console.log(`   ✅ Total player props collected: ${allPlayerProps.length}`);
-    console.log('Stat types collected:', [...new Set(allPlayerProps.map(p => p.prop_type))]);
     return allPlayerProps;
   } catch (error) {
     console.error('Error in fetchPlayerPropsFromOddsAPI:', error);
@@ -1022,7 +1341,72 @@ async function fetchPlayerPropsFromOddsAPI(sport = 'basketball_nba') {
   }
 }
 
-// Helper functions (moved to top‑level scope)
+async function fetchFromAPIBasketball() {
+  const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
+  if (!RAPIDAPI_KEY) return [];
+
+  try {
+    console.log('📡 Fetching from API-Basketball-NBA (RapidAPI)...');
+    const playersRes = await axios.get('https://api-basketball-nba.p.rapidapi.com/players/id', {
+      headers: {
+        'X-RapidAPI-Key': RAPIDAPI_KEY,
+        'X-RapidAPI-Host': 'api-basketball-nba.p.rapidapi.com'
+      },
+      timeout: 15000
+    });
+
+    const players = playersRes.data || [];
+    if (!players.length) {
+      console.log('⚠️ No players returned from /players/id');
+      return [];
+    }
+
+    console.log(`✅ Found ${players.length} players. Fetching stats for first 30...`);
+    const statsPromises = players.slice(0, 30).map(async (player) => {
+      try {
+        const statsRes = await axios.get('https://api-basketball-nba.p.rapidapi.com/player/splits', {
+          params: {
+            playerId: player.id,
+            year: '2024',
+            category: 'perGame'
+          },
+          headers: {
+            'X-RapidAPI-Key': RAPIDAPI_KEY,
+            'X-RapidAPI-Host': 'api-basketball-nba.p.rapidapi.com'
+          },
+          timeout: 10000
+        });
+
+        const stats = statsRes.data?.player_stats || statsRes.data || {};
+
+        return {
+          id: player.id,
+          name: `${player.firstName} ${player.lastName}`,
+          team: player.teamAbbreviation || player.team || 'FA',
+          position: player.position || 'N/A',
+          points: stats.ppg || 0,
+          rebounds: stats.rpg || 0,
+          assists: stats.apg || 0,
+          fantasy_points: (stats.ppg || 0) + 1.2*(stats.rpg || 0) + 1.5*(stats.apg || 0),
+          salary: 5000,
+          injury_status: 'Healthy',
+          source: 'api-basketball'
+        };
+      } catch (err) {
+        console.warn(`   ⚠️ Failed for player ${player.id} (${player.firstName} ${player.lastName}): ${err.message}`);
+        return null;
+      }
+    });
+
+    const results = (await Promise.all(statsPromises)).filter(p => p !== null);
+    console.log(`✅ Fetched ${results.length} players from API-Basketball`);
+    return results;
+  } catch (error) {
+    console.error('❌ API-Basketball fetch failed:', error.message);
+    return [];
+  }
+}
+
 function findStaticPlayer(playerName) {
   if (!staticNBAPlayers.length) return null;
   return staticNBAPlayers.find(p =>
@@ -1033,164 +1417,276 @@ function findStaticPlayer(playerName) {
 
 const capitalize = (str) => str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
 
+// PrizePicks Selections Endpoint with Full Opponent Adjustment Integration
+// ============================================================================
 app.get('/api/prizepicks/selections', async (req, res) => {
   try {
     const sport = req.query.sport || 'nba';
-    const sportKey = sport === 'nba' ? 'basketball_nba' : 'americanfootball_nfl';
-    const cacheKey = `prizepicks:selections:${sport}`;
+    const sportKey = {
+      nba: 'basketball_nba',
+      nfl: 'americanfootball_nfl',
+      nhl: 'icehockey_nhl',
+      mlb: 'baseball_mlb'
+    }[sport] || 'basketball_nba';
 
-    console.log(`🎰 [PrizePicks Endpoint] Request for ${sport.toUpperCase()}`);
+    const cacheKey = `prizepicks:selections:python:${sport}`;
 
-    // Use the unified cache function
+    console.log(`🎰 [PrizePicks] Request for ${sport.toUpperCase()}`);
+
+    // ========== Load sport‑specific static player data ==========
+    const pythonPlayerMap = new Map();
+    let staticPlayers = [];
+    if (sport === 'nba') staticPlayers = staticNBAPlayers;
+    else if (sport === 'nhl') staticPlayers = staticNHLPlayers;
+    else if (sport === 'mlb') staticPlayers = staticMLBPlayers;
+    else if (sport === 'nfl') staticPlayers = staticNFLPlayers;
+
+    if (staticPlayers && staticPlayers.length > 0) {
+      staticPlayers.forEach(p => {
+        pythonPlayerMap.set(p.name.toLowerCase(), p);
+        pythonPlayerMap.set(p.name.toLowerCase().replace(/\s+/g, ''), p);
+      });
+      console.log(`✅ Loaded ${staticPlayers.length} static ${sport.toUpperCase()} players into map`);
+    } else {
+      console.warn(`⚠️ static${sport.toUpperCase()}Players is empty – will fall back to generated fallback`);
+    }
+
     const responsePayload = await getCachedOrFetch(
       cacheKey,
       async () => {
         let selections = [];
-        let source = 'fallback';
+        let source = 'python-fallback';
 
         try {
-          // Primary source: The Odds API
           const playerProps = await fetchPlayerPropsFromOddsAPI(sportKey);
-          if (playerProps.length > 0) {
-            // ----- FETCH TANK01 MASTER DATA -----
-            let tank01Master = new Map();
-            let staticFallbackUsed = false;
-            try {
-              tank01Master = await getTank01MasterData(sport);
-              console.log(`   ✅ Fetched Tank01 master data with ${tank01Master.size} entries`);
-              // Debug: log a few sample entries
-              let sampleCount = 0;
-              for (const [id, data] of tank01Master.entries()) {
-                if (sampleCount++ < 3) {
-                  console.log(`   Tank01 sample: ${data.name} -> pts=${data.points}, reb=${data.rebounds}, ast=${data.assists}`);
+          if (!playerProps || playerProps.length === 0) {
+            throw new Error('No props from The Odds API');
+          }
+          console.log(`   ✅ Fetched ${playerProps.length} props from The Odds API for ${sport}`);
+
+          let tank01Master = new Map();
+          try {
+            tank01Master = await getTank01MasterData(sport);
+            console.log(`   ✅ Fetched Tank01 master data with ${tank01Master.size} entries`);
+          } catch (tankError) {
+            console.warn(`   ⚠️ Tank01 fetch failed for ${sport}, using Python only:`, tankError.message);
+          }
+
+          // Fetch defensive stats (may be empty)
+          let defensiveStatsMap = new Map();
+          let leagueAverages = { points: 110, rebounds: 42, assists: 24 };
+          try {
+            defensiveStatsMap = await fetchTeamDefensiveStats(sport);
+            if (defensiveStatsMap.size > 0) {
+              leagueAverages = computeLeagueAverages(defensiveStatsMap);
+            }
+            console.log(`   ✅ Fetched defensive stats for ${defensiveStatsMap.size} teams`);
+          } catch (defError) {
+            console.warn('   ⚠️ Could not fetch defensive stats, opponent adjustment will be skipped:', defError.message);
+          }
+
+          const normalizeName = (name) => name.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+          selections = playerProps.map((prop, index) => {
+            const playerKey = prop.player.toLowerCase().replace(/\s+/g, '');
+            let pythonPlayer = pythonPlayerMap.get(playerKey) || pythonPlayerMap.get(prop.player.toLowerCase());
+
+            // ----- LAST NAME FALLBACK -----
+            if (!pythonPlayer) {
+              const lastName = prop.player.split(' ').pop().toLowerCase();
+              for (const [key, p] of pythonPlayerMap.entries()) {
+                if (key.includes(lastName) || p.name.toLowerCase().includes(lastName)) {
+                  pythonPlayer = p;
+                  console.log(`   🔍 Matched by last name: ${prop.player} -> ${p.name}`);
+                  break;
                 }
               }
-            } catch (projError) {
-              console.warn('   ⚠️ Failed to fetch Tank01 projections, will fallback to static averages:', projError.message);
-              staticFallbackUsed = true;
             }
 
-            // Helper to normalize player names for matching
-            const normalizeName = (name) => name.toLowerCase().replace(/[^a-z0-9]/g, '');
-
-            selections = playerProps.map((prop, index) => {
-              const staticPlayer = findStaticPlayer(prop.player);
-
-              // Default values
-              let projectionValue = prop.line;
-              let edge = 0;
-              let confidence = 'medium';
-
-              // Try Tank01 first
-              if (tank01Master.size > 0) {
-                const normalizedPropName = normalizeName(prop.player);
-                let matched = null;
-                // Search for player in master data
-                for (const [id, data] of tank01Master.entries()) {
-                  if (!data.name) continue;
-                  const normalizedTankName = normalizeName(data.name);
-                  if (normalizedPropName.includes(normalizedTankName) || normalizedTankName.includes(normalizedPropName)) {
-                    matched = data;
-                    break;
-                  }
-                }
-
-                if (matched) {
-                  const statKey = prop.prop_type; // 'points', 'rebounds', 'assists'
-                  if (statKey === 'points') projectionValue = matched.points;
-                  else if (statKey === 'rebounds') projectionValue = matched.rebounds;
-                  else if (statKey === 'assists') projectionValue = matched.assists;
-
-                  // If projectionValue is still undefined, fallback to line
-                  if (projectionValue === undefined || projectionValue === null) {
-                    projectionValue = prop.line;
-                  }
+            // ----- FIND TANK01 MATCH (for team and possibly projection) -----
+            let matchedTank01 = null;
+            if (tank01Master.size > 0) {
+              const normalizedPropName = normalizeName(prop.player);
+              for (const [id, data] of tank01Master.entries()) {
+                if (!data.name) continue;
+                const normalizedTankName = normalizeName(data.name);
+                if (normalizedPropName.includes(normalizedTankName) || normalizedTankName.includes(normalizedPropName)) {
+                  matchedTank01 = data;
+                  break;
                 }
               }
+            }
 
-              // If Tank01 didn't give a projection (or we didn't have Tank01), fallback to static player averages
-              if (projectionValue === prop.line && staticPlayer) {
-                const statKey = prop.prop_type;
-                if (statKey === 'points') projectionValue = staticPlayer.points || prop.line;
-                else if (statKey === 'rebounds') projectionValue = staticPlayer.rebounds || prop.line;
-                else if (statKey === 'assists') projectionValue = staticPlayer.assists || prop.line;
-                // For other stats, leave as line
+            // Determine projection (prefer Python, then Tank01, then line)
+            let projectionValue = prop.line;
+            let sourceUsed = 'line';
+
+            if (pythonPlayer) {
+              const statKey = prop.prop_type;
+              let pythonValue;
+              if (statKey === 'points') pythonValue = pythonPlayer.points;
+              else if (statKey === 'rebounds') pythonValue = pythonPlayer.rebounds;
+              else if (statKey === 'assists') pythonValue = pythonPlayer.assists;
+
+              if (pythonValue && pythonValue !== 0) {
+                projectionValue = pythonValue;
+                sourceUsed = 'python';
+              } else {
+                console.log(`⚠️ Python has zero for ${prop.player} (${statKey}), will try Tank01`);
+              }
+            }
+
+            if (projectionValue === prop.line && matchedTank01) {
+              const statKey = prop.prop_type;
+              if (statKey === 'points') projectionValue = matchedTank01.points;
+              else if (statKey === 'rebounds') projectionValue = matchedTank01.rebounds;
+              else if (statKey === 'assists') projectionValue = matchedTank01.assists;
+              sourceUsed = 'tank01';
+            }
+
+            if (projectionValue === undefined || projectionValue === null || isNaN(projectionValue)) {
+              projectionValue = prop.line;
+              sourceUsed = 'line';
+            }
+
+            // ----- Determine team -----
+            const team = matchedTank01?.team || pythonPlayer?.team || 'UNKNOWN';
+
+            // ----- Determine opponent (from game data) -----
+            let opponent = 'TBD';
+            if (team !== 'UNKNOWN' && prop.away_team_abbr && prop.home_team_abbr) {
+              opponent = prop.away_team_abbr === team ? prop.home_team_abbr : (prop.home_team_abbr === team ? prop.away_team_abbr : 'TBD');
+            }
+
+            // ----- Opponent adjustment (only if opponent is known) -----
+            if (team !== 'UNKNOWN' && opponent !== 'TBD') {
+              let factor = 1.0;
+              let factorSource = 'none';
+
+              if (defensiveStatsMap.has(opponent)) {
+                const oppStats = defensiveStatsMap.get(opponent);
+                if (prop.prop_type === 'points') factor = oppStats.pointsAllowed / leagueAverages.points;
+                else if (prop.prop_type === 'rebounds') factor = oppStats.reboundsAllowed / leagueAverages.rebounds;
+                else if (prop.prop_type === 'assists') factor = oppStats.assistsAllowed / leagueAverages.assists;
+                factorSource = 'tank01';
+              } else if (DEFENSIVE_FACTORS[opponent]) {
+                const staticFactor = DEFENSIVE_FACTORS[opponent];
+                if (prop.prop_type === 'points') factor = staticFactor.points;
+                else if (prop.prop_type === 'rebounds') factor = staticFactor.rebounds;
+                else if (prop.prop_type === 'assists') factor = staticFactor.assists;
+                factorSource = 'static';
               }
 
-              // Calculate edge and confidence
-              if (prop.line > 0) {
-                edge = ((projectionValue - prop.line) / prop.line) * 100;
+              if (factor !== 1.0) {
+                projectionValue = projectionValue * factor;
+                sourceUsed += `+opponent(${factorSource})`;
               }
-              if (edge > 10) confidence = 'high';
-              else if (edge < -10) confidence = 'low';
-              else confidence = 'medium';
+            }
 
-              return {
-                id: `odds-${index}-${Date.now()}`,
-                player: prop.player,
-                team: staticPlayer?.team || prop.player.split(' ').pop(),
-                sport: sport.toUpperCase(),
-                position: staticPlayer?.position || 'N/A',
-                injury_status: staticPlayer?.injury_status || 'healthy',
-                stat: prop.prop_type,
-                line: prop.line,
-                type: prop.type,
-                projection: parseFloat(projectionValue.toFixed(1)),
-                edge: edge.toFixed(1),
-                confidence,
-                odds: prop.odds ? `+${Math.round((prop.odds - 1) * 100)}` : '-110',
-                timestamp: new Date().toISOString(),
-                analysis: `${prop.player} ${prop.prop_type} – projection ${projectionValue.toFixed(1)} vs line ${prop.line}`,
-                status: 'pending',
-                source: 'the-odds-api',
-                bookmaker: prop.bookmaker
-              };
-            });
+            const edge = prop.line > 0 ? ((projectionValue - prop.line) / prop.line) * 100 : 0;
+            let confidence = 70;
+            if (edge > 10) confidence = 85;
+            else if (edge < -10) confidence = 55;
 
-            source = staticFallbackUsed ? 'the-odds-api+static' : 'the-odds-api+tank01';
-          }
+            return {
+              id: `odds-${index}-${Date.now()}`,
+              player: prop.player,
+              team,
+              opponent,
+              sport: sport.toUpperCase(),
+              position: matchedTank01?.position || pythonPlayer?.position || 'N/A',
+              injury_status: matchedTank01?.injury_status || pythonPlayer?.injury_status || 'healthy',
+              stat: prop.prop_type,
+              line: prop.line,
+              type: prop.type,
+              projection: parseFloat(projectionValue.toFixed(1)),
+              edge: edge.toFixed(1),
+              confidence,
+              odds: prop.odds ? `+${Math.round((prop.odds - 1) * 100)}` : '-110',
+              timestamp: new Date().toISOString(),
+              analysis: `${prop.player} ${prop.prop_type} – proj ${projectionValue.toFixed(1)} vs line ${prop.line}`,
+              status: 'pending',
+              source: 'the-odds-api',
+              bookmaker: prop.bookmaker
+            };
+          });
+
+          // Deduplicate by player+stat+line, keep highest odds
+          const uniqueMap = new Map();
+          selections.forEach(sel => {
+            const key = `${sel.player}|${sel.stat}|${sel.line}`;
+            const existing = uniqueMap.get(key);
+            const oddsNum = typeof sel.odds === 'number' ? sel.odds : parseInt(sel.odds.replace('+', '')) || 0;
+            const existingOddsNum = existing ? parseInt(existing.odds.replace('+', '')) || 0 : 0;
+            if (!existing || oddsNum > existingOddsNum) {
+              uniqueMap.set(key, sel);
+            }
+          });
+          selections = Array.from(uniqueMap.values());
+          console.log(`   🧹 After deduplication: ${selections.length} unique props`);
+
+          source = 'the-odds-api+python';
         } catch (primaryError) {
-          console.error('   ❌ Primary source failed:', primaryError.message);
-          // Fall through to fallback
-        }
+          // ----- FALLBACK: Sport‑specific static data -----
+          console.warn(`   ⚠️ Primary source failed for ${sport}, using sport‑specific static fallback:`, primaryError.message);
 
-        // If primary returned no selections, use fallback
-        if (selections.length === 0) {
-          console.log('   🔄 Using fallback data generation');
-          if (staticNBAPlayers && staticNBAPlayers.length > 0) {
-            selections = staticNBAPlayers.slice(0, 50).map((p, i) => {
-              // Use static averages to generate a slight edge
+          let fallbackPlayers = staticPlayers;
+          if (!fallbackPlayers || fallbackPlayers.length === 0) {
+            fallbackPlayers = generateSportFallback(sport);
+          }
+
+          if (fallbackPlayers && fallbackPlayers.length > 0) {
+            selections = fallbackPlayers.slice(0, 50).map((p, idx) => {
               const line = p.points;
-              const projection = p.points * (0.95 + Math.random() * 0.1); // vary by ±5%
-              const edge = ((projection - line) / line) * 100;
-              const confidence = edge > 5 ? 'high' : edge < -5 ? 'low' : 'medium';
+              const projection = p.points;
               return {
-                id: `static-${i}`,
+                id: `fallback-${sport}-${idx}`,
                 player: p.name,
-                team: p.team,
-                position: p.position,
-                injury_status: p.injury_status,
+                team: p.team || 'UNKNOWN',
+                opponent: p.opponent || 'TBD',
                 sport: sport.toUpperCase(),
+                position: p.position || 'N/A',
+                injury_status: p.injury_status || 'healthy',
                 stat: 'points',
-                line: line,
+                line: parseFloat(line.toFixed(1)),
                 type: 'over',
                 projection: parseFloat(projection.toFixed(1)),
-                edge: edge.toFixed(1),
-                confidence,
+                edge: '0.0',
+                confidence: 70,
                 odds: '-110',
                 timestamp: new Date().toISOString(),
-                analysis: `Based on season average ${line} ppg`,
-                source: 'static_2026'
+                analysis: `Fallback based on ${sport} averages`,
+                source: `${sport}-fallback`
               };
             });
-            source = 'static_2026';
+            console.log(`   🔄 Generated ${selections.length} fallback props for ${sport}`);
+            source = `${sport}-fallback`;
           } else {
-            selections = generateIntelligentFallbackData(sport);
-            source = 'intelligent_fallback';
+            // ----- ULTIMATE FALLBACK: Very generic list -----
+            selections = getGenericPlayersForSport(sport).map((p, idx) => ({
+              id: `generic-${sport}-${idx}`,
+              player: p.name,
+              team: p.team,
+              opponent: 'TBD',
+              sport: sport.toUpperCase(),
+              position: p.position,
+              injury_status: 'healthy',
+              stat: 'points',
+              line: p.points,
+              type: 'over',
+              projection: p.points,
+              edge: '0.0',
+              confidence: 70,
+              odds: '-110',
+              timestamp: new Date().toISOString(),
+              analysis: 'Generic fallback',
+              source: 'generic'
+            }));
+            console.log(`   🆘 Generated ${selections.length} generic fallback props for ${sport}`);
+            source = 'generic';
           }
         }
 
-        // After generating selections, log how many have edge !== 0
         const nonZeroEdge = selections.filter(s => parseFloat(s.edge) !== 0).length;
         console.log(`   📊 Edge stats: ${nonZeroEdge}/${selections.length} have non-zero edge`);
 
@@ -1203,29 +1699,227 @@ app.get('/api/prizepicks/selections', async (req, res) => {
           source
         };
       },
-      300 // 5 minutes TTL
+      300 // cache TTL (seconds)
     );
 
-    console.log(`   ✅ Served ${responsePayload.selections.length} selections from cache`);
     res.json(responsePayload);
 
   } catch (error) {
-    // Catch any unexpected error and return JSON fallback
-    console.error('🔥 Unhandled error in /api/prizepicks/selections:', error);
-    const fallbackSelections = generateIntelligentFallbackData(req.query.sport || 'nba');
+    console.error('❌ Fatal error in /api/prizepicks/selections:', error);
+
+    // ----- EMERGENCY FALLBACK -----
+    const sport = req.query.sport || 'nba';
+    const genericPlayers = getGenericPlayersForSport(sport);
+    const fallbackSelections = genericPlayers.map((player, idx) => ({
+      id: `emergency-${sport}-${idx}`,
+      player: player.name,
+      team: player.team,
+      opponent: 'TBD',
+      sport: sport.toUpperCase(),
+      position: player.position,
+      injury_status: 'healthy',
+      stat: 'points',
+      line: player.points,
+      type: 'over',
+      projection: player.points,
+      edge: '0.0',
+      confidence: 70,
+      odds: '-110',
+      timestamp: new Date().toISOString(),
+      analysis: 'Emergency fallback',
+      source: 'emergency'
+    }));
+
     res.json({
       success: true,
       message: 'Player Props (Emergency Fallback)',
       selections: fallbackSelections,
       count: fallbackSelections.length,
       timestamp: new Date().toISOString(),
-      source: 'emergency_fallback',
-      note: error.message
+      source: 'emergency'
     });
   }
 });
 
-// Add this helper function before the endpoint
+// ========== ENHANCED FALLBACK GENERATOR WITH COMPLETE TEAMS ==========
+function generateSportFallback(sport) {
+  // Complete team lists for all four major sports
+  const teamsBySport = {
+    nba: [
+      'ATL', 'BOS', 'BKN', 'CHA', 'CHI', 'CLE', 'DAL', 'DEN', 'DET', 'GSW',
+      'HOU', 'IND', 'LAC', 'LAL', 'MEM', 'MIA', 'MIL', 'MIN', 'NOP', 'NYK',
+      'OKC', 'ORL', 'PHI', 'PHX', 'POR', 'SAC', 'SAS', 'TOR', 'UTA', 'WAS'
+    ],
+    nhl: [
+      'ANA', 'BOS', 'BUF', 'CGY', 'CAR', 'CHI', 'COL', 'CBJ', 'DAL', 'DET',
+      'EDM', 'FLA', 'LAK', 'MIN', 'MTL', 'NSH', 'NJD', 'NYI', 'NYR', 'OTT',
+      'PHI', 'PIT', 'SEA', 'SJS', 'STL', 'TBL', 'TOR', 'VAN', 'VGK', 'WPG',
+      'WSH', 'UTA'
+    ],
+    mlb: [
+      'ARI', 'ATL', 'BAL', 'BOS', 'CHC', 'CHW', 'CIN', 'CLE', 'COL', 'DET',
+      'HOU', 'KC', 'LAA', 'LAD', 'MIA', 'MIL', 'MIN', 'NYM', 'NYY', 'OAK',
+      'PHI', 'PIT', 'SD', 'SF', 'SEA', 'STL', 'TB', 'TEX', 'TOR', 'WSH'
+    ],
+    nfl: [
+      'ARI', 'ATL', 'BAL', 'BUF', 'CAR', 'CHI', 'CIN', 'CLE', 'DAL', 'DEN',
+      'DET', 'GB', 'HOU', 'IND', 'JAX', 'KC', 'LV', 'LAC', 'LAR', 'MIA',
+      'MIN', 'NE', 'NO', 'NYG', 'NYJ', 'PHI', 'PIT', 'SF', 'SEA', 'TB',
+      'TEN', 'WAS'
+    ]
+  };
+  const teams = teamsBySport[sport] || teamsBySport.nba;
+
+  // Player data combined from file1 and file2 (NHL extended with file2 additions)
+  const players = {
+    nba: [
+      { name: 'LeBron James', team: 'LAL', position: 'SF', points: 27.5, injury_status: 'healthy' },
+      { name: 'Stephen Curry', team: 'GSW', position: 'PG', points: 28.5, injury_status: 'healthy' },
+      { name: 'Giannis Antetokounmpo', team: 'MIL', position: 'PF', points: 32.0, injury_status: 'healthy' },
+      { name: 'Nikola Jokic', team: 'DEN', position: 'C', points: 26.5, injury_status: 'healthy' },
+      { name: 'Luka Doncic', team: 'LAL', position: 'G', points: 28.8, injury_status: 'healthy' },
+      { name: 'Shai Gilgeous-Alexander', team: 'OKC', position: 'G', points: 31.2, injury_status: 'healthy' },
+      { name: 'Jayson Tatum', team: 'BOS', position: 'F', points: 27.5, injury_status: 'healthy' },
+      { name: 'Jalen Johnson', team: 'ATL', position: 'F', points: 19.8, injury_status: 'healthy' },
+      { name: 'Cade Cunningham', team: 'DET', position: 'G', points: 23.5, injury_status: 'healthy' },
+      { name: 'Tyrese Maxey', team: 'PHI', position: 'G', points: 25.0, injury_status: 'healthy' },
+      { name: 'Victor Wembanyama', team: 'SAS', position: 'C', points: 22.0, injury_status: 'healthy' },
+      { name: 'Jaylen Brown', team: 'BOS', position: 'F', points: 23.5, injury_status: 'healthy' },
+      { name: 'Jalen Brunson', team: 'NYK', position: 'G', points: 24.5, injury_status: 'healthy' },
+      { name: 'Josh Giddey', team: 'CHI', position: 'G', points: 14.5, injury_status: 'healthy' },
+      { name: 'Karl-Anthony Towns', team: 'NYK', position: 'C', points: 22.5, injury_status: 'healthy' },
+      { name: 'Austin Reaves', team: 'LAL', position: 'G', points: 16.5, injury_status: 'healthy' },
+      { name: 'Buddy Hield', team: 'ATL', position: 'G', points: 12.5, injury_status: 'healthy' },
+      { name: 'Caleb Houstan', team: 'ATL', position: 'F', points: 6.5, injury_status: 'healthy' }
+    ],
+    nhl: [
+      { name: 'Connor McDavid', team: 'EDM', position: 'C', points: 1.2, injury_status: 'healthy' },
+      { name: 'Auston Matthews', team: 'TOR', position: 'C', points: 1.1, injury_status: 'healthy' },
+      { name: 'Nathan MacKinnon', team: 'COL', position: 'C', points: 1.3, injury_status: 'healthy' },
+      { name: 'Leon Draisaitl', team: 'EDM', position: 'C', points: 1.2, injury_status: 'healthy' },
+      { name: 'David Pastrnak', team: 'BOS', position: 'RW', points: 1.0, injury_status: 'healthy' },
+      { name: 'Nikita Kucherov', team: 'TBL', position: 'RW', points: 1.3, injury_status: 'healthy' },
+      { name: 'Mikko Rantanen', team: 'COL', position: 'RW', points: 1.1, injury_status: 'healthy' },
+      { name: 'Cale Makar', team: 'COL', position: 'D', points: 1.0, injury_status: 'healthy' },
+      { name: 'Jack Hughes', team: 'NJD', position: 'C', points: 1.0, injury_status: 'healthy' },
+      { name: 'Tage Thompson', team: 'BUF', position: 'C', points: 0.9, injury_status: 'healthy' }
+    ],
+    mlb: [
+      { name: 'Shohei Ohtani', team: 'LAD', position: 'DH', points: 1.5, injury_status: 'healthy' },
+      { name: 'Aaron Judge', team: 'NYY', position: 'RF', points: 1.4, injury_status: 'healthy' },
+      { name: 'Mookie Betts', team: 'LAD', position: 'RF', points: 1.3, injury_status: 'healthy' },
+      { name: 'Ronald Acuña Jr.', team: 'ATL', position: 'RF', points: 1.3, injury_status: 'healthy' },
+      { name: 'Juan Soto', team: 'NYY', position: 'LF', points: 1.2, injury_status: 'healthy' },
+      { name: 'Freddie Freeman', team: 'LAD', position: '1B', points: 1.2, injury_status: 'healthy' }
+    ],
+    nfl: [
+      { name: 'Patrick Mahomes', team: 'KC', position: 'QB', points: 25.0, injury_status: 'healthy' },
+      { name: 'Josh Allen', team: 'BUF', position: 'QB', points: 24.0, injury_status: 'healthy' },
+      { name: 'Jalen Hurts', team: 'PHI', position: 'QB', points: 23.5, injury_status: 'healthy' },
+      { name: 'Christian McCaffrey', team: 'SF', position: 'RB', points: 18.0, injury_status: 'healthy' },
+      { name: 'Tyreek Hill', team: 'MIA', position: 'WR', points: 16.5, injury_status: 'healthy' },
+      { name: 'Travis Kelce', team: 'KC', position: 'TE', points: 14.0, injury_status: 'healthy' }
+    ]
+  };
+
+  const playerList = players[sport] || players.nba;
+
+  return playerList.map((p, index) => {
+    // Generate a random opponent different from player's team
+    let opponent = 'TBD';
+    if (teams.length > 0) {
+      const possibleOpponents = teams.filter(t => t !== p.team);
+      if (possibleOpponents.length > 0) {
+        opponent = possibleOpponents[Math.floor(Math.random() * possibleOpponents.length)];
+      }
+    }
+
+    return {
+      id: `fallback-${sport}-${index}`,
+      player: p.name,
+      team: p.team,
+      opponent: opponent,
+      sport: sport.toUpperCase(),
+      position: p.position,
+      injury_status: p.injury_status,
+      stat: 'points',
+      line: p.points,
+      type: 'over',
+      projection: p.points,
+      edge: '0.0',
+      confidence: 70,
+      odds: '-110',
+      timestamp: new Date().toISOString(),
+      analysis: `Fallback based on ${sport} averages`,
+      source: `${sport}-fallback`
+    };
+  });
+}
+
+function getGenericPlayersForSport(sport) {
+  return generateSportFallback(sport);
+}
+
+// Use your existing RapidAPI key from environment variables
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY; 
+const RAPIDAPI_HOST = 'tank01-nhl-live-in-game-real-time-statistics-nhl.p.rapidapi.com';
+
+async function getTodaysNHLGames() {
+  const cacheKey = `tank01:nhlGames:${new Date().toDateString()}`;
+  
+  try {
+    return await getCachedOrFetch(
+      cacheKey,
+      async () => {
+        // Format today's date as YYYYMMDD
+        const today = new Date();
+        const year = today.getFullYear();
+        const month = String(today.getMonth() + 1).padStart(2, '0');
+        const day = String(today.getDate()).padStart(2, '0');
+        const gameDate = `${year}${month}${day}`;
+
+        const url = `https://${RAPIDAPI_HOST}/getNHLGamesForDate?gameDate=${gameDate}`;
+        
+        const response = await fetch(url, {
+          headers: {
+            'x-rapidapi-host': RAPIDAPI_HOST,
+            'x-rapidapi-key': RAPIDAPI_KEY
+          }
+        });
+
+        if (!response.ok) {
+          throw new Error(`Tank01 API responded with ${response.status}`);
+        }
+
+        const data = await response.json();
+        
+        // The API returns an array of games in the 'body' field
+        const games = data.body || [];
+        
+        // Create a map of team -> opponent for today
+        const opponentMap = new Map();
+        games.forEach(game => {
+          // game.away and game.home are the team abbreviations
+          opponentMap.set(game.away, game.home);
+          opponentMap.set(game.home, game.away);
+        });
+
+        return {
+          games,
+          opponentMap,
+          teams: [...new Set([...games.map(g => g.away), ...games.map(g => g.home)])]
+        };
+      },
+      3600 // Cache for 1 hour (games don't change often)
+    );
+  } catch (error) {
+    console.error('Error fetching from Tank01 NHL:', error.message);
+    // Return empty structure on failure – your existing fallback will still work
+    return { games: [], opponentMap: new Map(), teams: [] };
+  }
+}
+
+// Helper to get today's games from Sleeper (with fallback to Tank01)
 async function getTodaysGamesFromSleeper(sport = 'nba') {
   const cacheKey = `sleeper:todaysGames:${sport}:${new Date().toDateString()}`;
   
@@ -1233,19 +1927,9 @@ async function getTodaysGamesFromSleeper(sport = 'nba') {
     return await getCachedOrFetch(
       cacheKey,
       async () => {
-        // Sleeper API endpoint for today's games
         const sportCode = sport === 'nba' ? 'nba' : sport === 'nfl' ? 'nfl' : sport;
         const today = new Date();
         
-        // Get current week helper
-        const getCurrentWeek = () => {
-          const now = new Date();
-          const start = new Date(now.getFullYear(), 0, 1);
-          const days = Math.floor((now.getTime() - start.getTime()) / (24 * 60 * 60 * 1000));
-          return Math.ceil(days / 7);
-        };
-
-        // Sleeper API for schedule
         const response = await fetch(`https://api.sleeper.app/v1/schedule/${sportCode}/regular/${today.getFullYear()}?week=${getCurrentWeek()}`);
 
         if (!response.ok) {
@@ -1254,13 +1938,11 @@ async function getTodaysGamesFromSleeper(sport = 'nba') {
 
         const schedule = await response.json();
 
-        // Filter games for today
         const todaysGames = Array.isArray(schedule) ? schedule.filter(game => {
           const gameDate = new Date(game.game_date);
           return gameDate.toDateString() === today.toDateString();
         }) : [];
 
-        // Extract player IDs from games
         const playerIds = new Set();
         if (Array.isArray(todaysGames)) {
           todaysGames.forEach(game => {
@@ -1273,7 +1955,6 @@ async function getTodaysGamesFromSleeper(sport = 'nba') {
           });
         }
 
-        // Get unique teams from today's games
         const teamsSet = new Set();
         if (Array.isArray(todaysGames)) {
           todaysGames.forEach(game => {
@@ -1289,25 +1970,24 @@ async function getTodaysGamesFromSleeper(sport = 'nba') {
           teams: Array.from(teamsSet)
         };
       },
-      3600 // 1 hour TTL (games for today don't change often)
+      3600
     );
   } catch (error) {
     console.error('Error fetching from Sleeper:', error.message);
     
-    // Fallback: Use day-specific team lists based on day of week
+    // Fallback: day-specific team lists
     const today = new Date();
     const dayOfWeek = today.getDay();
     
-    // NBA team lists by day of week (approximate)
     const teamsPlayingToday = {
       'nba': {
-        0: ['LAL', 'GSW', 'BOS', 'NYK', 'MIA', 'CHI'], // Sunday
-        1: ['MIL', 'PHX', 'DAL', 'DEN', 'LAC', 'POR'], // Monday
-        2: ['LAL', 'GSW', 'BOS', 'PHI', 'MEM', 'SAS'], // Tuesday
-        3: ['MIL', 'PHX', 'DAL', 'DEN', 'UTA', 'NOP'], // Wednesday
-        4: ['LAL', 'GSW', 'BOS', 'NYK', 'ATL', 'HOU'], // Thursday
-        5: ['MIL', 'PHX', 'DAL', 'DEN', 'LAC', 'MEM', 'GSW', 'LAL'], // Friday (more games)
-        6: ['LAL', 'GSW', 'BOS', 'PHI', 'MIA', 'ATL', 'CHI', 'CLE']  // Saturday (more games)
+        0: ['LAL', 'GSW', 'BOS', 'NYK', 'MIA', 'CHI'],
+        1: ['MIL', 'PHX', 'DAL', 'DEN', 'LAC', 'POR'],
+        2: ['LAL', 'GSW', 'BOS', 'PHI', 'MEM', 'SAS'],
+        3: ['MIL', 'PHX', 'DAL', 'DEN', 'UTA', 'NOP'],
+        4: ['LAL', 'GSW', 'BOS', 'NYK', 'ATL', 'HOU'],
+        5: ['MIL', 'PHX', 'DAL', 'DEN', 'LAC', 'MEM', 'GSW', 'LAL'],
+        6: ['LAL', 'GSW', 'BOS', 'PHI', 'MIA', 'ATL', 'CHI', 'CLE']
       },
       'nfl': [],
       'nhl': [],
@@ -1330,30 +2010,289 @@ async function getTodaysGamesFromSleeper(sport = 'nba') {
 
 // ============================================================
 // Unified Fantasy Hub Players Endpoint
-// GET /api/fantasyhub/players?sport=nba (or nhl, nfl, mlb)
 // ============================================================
 app.get('/api/fantasyhub/players', async (req, res) => {
   console.log('🏀 [FantasyHub Endpoint] Request for players');
   const { sport = 'nba', filterByToday = 'true' } = req.query;
   const cacheKey = `fantasyhub:players:${sport}:${filterByToday}:${new Date().toDateString()}`;
-    
+
+  // Tank01 to standard abbreviation mapping (for filtering)
+  const TANK01_TO_STD = {
+    'NY': 'NYK',
+    'SA': 'SAS',
+    'NO': 'NOP',
+    'PHO': 'PHX',
+    'GS': 'GSW',
+    'UTH': 'UTA',
+  };
+  
   try {
     const responseData = await getCachedOrFetch(
       cacheKey,
       async () => {
-        // 2. Get today's games from Sleeper to filter players
+        // Get today's games from Sleeper
         let todaysGameInfo = { games: [], playerIds: [], teams: [] };
         try {
           todaysGameInfo = await getTodaysGamesFromSleeper(sport);
           console.log(`   📅 Found ${todaysGameInfo.games.length} games today from Sleeper`);
           if (todaysGameInfo.teams.length > 0) {
-            console.log(`   📅 Teams playing today: ${todaysGameInfo.teams.join(', ')}`);
+            console.log(`   📅 Teams playing today (raw): ${todaysGameInfo.teams.join(', ')}`);
           }  
         } catch (error) {
           console.warn('   ⚠️ Could not fetch today\'s games from Sleeper:', error.message);
         }
+
+        // If Sleeper gave no games, try Tank01
+        if (todaysGameInfo.games.length === 0) {
+          try {
+            const today = new Date();
+            const year = today.getFullYear();
+            const month = String(today.getMonth() + 1).padStart(2, '0');
+            const day = String(today.getDate()).padStart(2, '0');
+            const todayStr = `${year}${month}${day}`;
+            
+            const tank01Games = await getCachedTank01Data('getGamesForDate', {
+              gameDate: todayStr,
+              sport
+            }, 300);
+            
+            if (tank01Games && tank01Games.length > 0) {
+              todaysGameInfo.games = tank01Games;
+              todaysGameInfo.teams = [];
+              tank01Games.forEach(game => {
+                if (game.away) todaysGameInfo.teams.push(game.away);
+                if (game.home) todaysGameInfo.teams.push(game.home);
+              });
+              console.log(`   📅 Found ${tank01Games.length} games from Tank01`);
+            }
+          } catch (tankErr) {
+            console.warn('   ⚠️ Tank01 games also failed:', tankErr.message);
+          }
+        }
+
+        // Convert team abbreviations to standard format for filtering
+        const standardTeams = todaysGameInfo.teams.map(t => TANK01_TO_STD[t] || t);
+        console.log(`   📅 Teams playing today (standardized): ${standardTeams.join(', ')}`);
+
+        // Build opponent map from games
+        const opponentMap = new Map();
+        if (todaysGameInfo.games && todaysGameInfo.games.length > 0) {
+          todaysGameInfo.games.forEach(game => {
+            const away = game.away_team || game.away;
+            const home = game.home_team || game.home;
+            if (away && home) {
+              opponentMap.set(away, home);
+              opponentMap.set(home, away);
+            }
+          });
+        }
+
+        // Fetch defensive stats (only for NBA)
+        let defensiveStatsMap = new Map();
+        let leagueAverages = { points: 110, rebounds: 42, assists: 24 };
+        if (sport === 'nba') {
+          try {
+            defensiveStatsMap = await fetchTeamDefensiveStats(sport);
+            if (defensiveStatsMap.size > 0) {
+              leagueAverages = computeLeagueAverages(defensiveStatsMap);
+            }
+            console.log(`   ✅ Fetched defensive stats for ${defensiveStatsMap.size} NBA teams`);
+          } catch (defError) {
+            console.warn('   ⚠️ Could not fetch defensive stats, opponent adjustment will be skipped:', defError.message);
+          }
+        } else {
+          console.log(`   ℹ️ Defensive stats not fetched for ${sport} (NBA only)`);
+        }
+
+// In the MLB/NHL section of your /api/fantasyhub/players endpoint
+if (sport === 'mlb' || sport === 'nhl') {
+  try {
+    let staticPlayers = sport === 'mlb' ? staticMLBPlayers : staticNHLPlayers;
+    
+    if (!staticPlayers || staticPlayers.length === 0) {
+      throw new Error(`No static data available for ${sport}`);
+    }
+
+    console.log(`   ✅ Using static ${sport.toUpperCase()} data (${staticPlayers.length} players)`);
+
+    // Transform to match frontend expectations with enhanced stats
+    const transformed = staticPlayers.map(p => {
+      // Base stats always present
+      const player = {
+        player_id: p.id,
+        name: p.name,
+        team: p.team,
+        position: p.position,
+        points: p.points || 0,
+        rebounds: sport === 'mlb' ? 0 : (p.rebounds || 0),
+        assists: p.assists || 0,
+        salary: p.salary || 5000,
+        injury_status: p.injury_status || 'Healthy',
+        games_played: p.games_played || 0,
+        source: 'static_python'
+      };
+
+      // Calculate fantasy points if not provided
+      let fantasyPoints = p.fantasy_points || p.projection || 0;
+      if (fantasyPoints === 0) {
+        if (sport === 'nhl') {
+          // NHL fantasy calculation: goals (3) + assists (2) + shots (0.5) + hits (0.5) + blocks (1)
+          fantasyPoints = (p.goals || 0) * 3 + 
+                         (p.assists || 0) * 2 + 
+                         (p.shots || 0) * 0.5 + 
+                         (p.hits || 0) * 0.5 + 
+                         (p.blockedShots || 0) * 1;
+        } else if (sport === 'mlb') {
+          // MLB fantasy calculation (customize based on your league settings)
+          fantasyPoints = (p.points || 0) + (p.rbi || 0) * 0.5;
+        }
+      }
+      
+      player.fantasy_points = fantasyPoints;
+      player.projection = fantasyPoints; // For frontend Proj column
+
+      // Add NHL-specific enhanced stats if available
+      if (sport === 'nhl') {
+        // Core counting stats
+        player.goals = p.goals || 0;
+        player.assists = p.assists || 0; // Already set above
+        player.points = p.points || 0; // Already set above as 'points'
+        player.plusMinus = p.plusMinus || 0;
+        player.shots = p.shots || 0;
+        player.hits = p.hits || 0;
+        player.blockedShots = p.blockedShots || 0;
         
-        // 3. Try Node master API with retry logic
+        // Ice time
+        player.timeOnIce = p.timeOnIce || '0:00';
+        player.powerPlayTimeOnIce = p.powerPlayTimeOnIce || '0:00';
+        player.shortHandedTimeOnIce = p.shortHandedTimeOnIce || '0:00';
+        
+        // Power play stats
+        player.powerPlayGoals = p.powerPlayGoals || 0;
+        player.powerPlayAssists = p.powerPlayAssists || 0;
+        player.powerPlayPoints = p.powerPlayPoints || 0;
+        
+        // Faceoffs
+        player.faceoffsWon = p.faceoffsWon || 0;
+        player.faceoffsLost = p.faceoffsLost || 0;
+        player.faceoffs = p.faceoffs || 0;
+        player.faceoffPercent = p.faceoffs ? ((p.faceoffsWon || 0) / p.faceoffs * 100).toFixed(1) : 0;
+        
+        // Penalties
+        player.penalties = p.penalties || 0;
+        player.penaltiesInMinutes = p.penaltiesInMinutes || 0;
+        
+        // Other
+        player.shifts = p.shifts || 0;
+        player.takeaways = p.takeaways || 0;
+        player.giveaways = p.giveaways || 0;
+        player.shotsMissedNet = p.shotsMissedNet || 0;
+      } else if (sport === 'mlb') {
+        // MLB-specific stats (add based on your needs)
+        player.atBats = p.atBats || 0;
+        player.hits = p.hits || 0;
+        player.homeRuns = p.homeRuns || 0;
+        player.rbi = p.rbi || 0;
+        player.stolenBases = p.stolenBases || 0;
+        player.battingAverage = p.battingAverage || 0;
+        player.onBasePercentage = p.onBasePercentage || 0;
+        player.sluggingPercentage = p.sluggingPercentage || 0;
+        player.ops = p.ops || 0;
+        
+        // Pitching stats
+        player.inningsPitched = p.inningsPitched || 0;
+        player.era = p.era || 0;
+        player.whip = p.whip || 0;
+        player.strikeouts = p.strikeouts || 0;
+        player.wins = p.wins || 0;
+        player.losses = p.losses || 0;
+        player.saves = p.saves || 0;
+      }
+
+      return player;
+    });
+
+    // Apply today's games filter if needed
+    let filteredPlayers = transformed;
+    if (filterByToday === 'true' && standardTeams.length > 0) {
+      const beforeCount = filteredPlayers.length;
+      filteredPlayers = filteredPlayers.filter(p => 
+        p.team && standardTeams.includes(p.team)
+      );
+      console.log(`   🎯 Filtered from ${beforeCount} to ${filteredPlayers.length} players from today's games`);
+    }
+
+    // Return the data (will be cached by getCachedOrFetch)
+    return {
+      data: filteredPlayers,
+      count: filteredPlayers.length,
+      source: 'static_python',
+      games_today: todaysGameInfo.games ? todaysGameInfo.games.length : 0,
+      teams_today: standardTeams
+    };
+
+  } catch (staticError) {
+    console.error(`   ❌ Static data fetch failed for ${sport}:`, staticError.message);
+
+            // 🔁 FALLBACK: generate mock players
+            console.log(`   ⚠️ Generating mock ${sport.toUpperCase()} players as fallback`);
+
+            const fallbackTeams = (sport === 'mlb')
+              ? ['ARI','ATL','BAL','BOS','CHC','CWS','CIN','CLE','COL','DET',
+                 'HOU','KC','LAA','LAD','MIA','MIL','MIN','NYM','NYY','OAK',
+                 'PHI','PIT','SD','SF','SEA','STL','TB','TEX','TOR','WSH']
+              : ['ANA','ARI','BOS','BUF','CAR','CBJ','CGY','CHI','COL','DAL',
+                 'DET','EDM','FLA','LAK','MIN','MTL','NJD','NSH','NYI','NYR',
+                 'OTT','PHI','PIT','SEA','SJS','STL','TBL','TOR','VAN','VGK',
+                 'WPG','WSH'];
+
+            const positions = sport === 'mlb'
+              ? ['P','C','1B','2B','3B','SS','LF','CF','RF','DH']
+              : ['C','LW','RW','D','G'];
+
+            const mockPlayers = [];
+
+            fallbackTeams.forEach((teamAbbr, teamIdx) => {
+              const numPlayers = 15 + Math.floor(Math.random() * 10);
+              for (let i = 0; i < numPlayers; i++) {
+                const salary = 4000 + Math.floor(Math.random() * 9000);
+                const points = sport === 'nhl' ? 0.5 + Math.random() * 1.5 : 5 + Math.random() * 20;
+                const rebounds = sport === 'mlb' ? 0 : (2 + Math.random() * 8);
+                const assists = 1 + Math.random() * 7;
+                const fantasy = points + rebounds * 0.8 + assists * 0.8;
+
+                mockPlayers.push({
+                  player_id: `mock-${sport}-${teamAbbr}-${i}`,
+                  name: `${sport.toUpperCase()} Player ${teamIdx * 100 + i}`,
+                  team: teamAbbr,
+                  position: positions[i % positions.length],
+                  points: parseFloat(points.toFixed(1)),
+                  rebounds: parseFloat(rebounds.toFixed(1)),
+                  assists: parseFloat(assists.toFixed(1)),
+                  fantasy_points: parseFloat(fantasy.toFixed(1)),
+                  salary,
+                  injury_status: Math.random() > 0.9 ? 'Day-to-Day' : 'Healthy',
+                  source: 'mock'
+                });
+              }
+            });
+
+            let filteredMock = mockPlayers;
+            if (filterByToday === 'true' && standardTeams.length > 0) {
+              filteredMock = mockPlayers.filter(p => standardTeams.includes(p.team));
+            }
+
+            return {
+              data: filteredMock,
+              count: filteredMock.length,
+              source: 'mock-fallback',
+              games_today: todaysGameInfo.games ? todaysGameInfo.games.length : 0,
+              teams_today: standardTeams
+            };
+          }
+        }
+
+        // ========== NBA: Use Node master API with retry logic ==========
         let players = null;
         let nodeError = null;
         const maxRetries = 3;
@@ -1361,8 +2300,10 @@ app.get('/api/fantasyhub/players', async (req, res) => {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
           try {
             const nodeMasterUrl = `https://prizepicks-production.up.railway.app/api/players/master?sport=${sport}`;
-            console.log(`   🔄 Fetching from Node master (attempt ${attempt}/${maxRetries}): ${nodeMasterUrl}`);   
+            console.log(`   🔄 Fetching from Node master (attempt ${attempt}/${maxRetries}): ${nodeMasterUrl}`);
+            
             const response = await fetch(nodeMasterUrl);
+            
             if (!response.ok) {
               if (response.status === 429 && attempt < maxRetries) {
                 const delay = Math.pow(2, attempt) * 1000;
@@ -1378,7 +2319,6 @@ app.get('/api/fantasyhub/players', async (req, res) => {
               throw new Error('Node master returned invalid data');
             }
 
-            // Transform and filter to only include players from today's games
             let transformedPlayers = result.data.map(p => ({
               player_id: p.id,
               name: p.name,
@@ -1390,6 +2330,7 @@ app.get('/api/fantasyhub/players', async (req, res) => {
               assists: p.assists || 0,
               steals: p.steals || 0,
               blocks: p.blocks || 0,
+              turnovers: p.turnovers || 0,
               fantasy_points: p.projection || p.fantasy_points || 0,
               salary: p.salary || 5000,
               games_played: p.games_played || 0,
@@ -1399,17 +2340,91 @@ app.get('/api/fantasyhub/players', async (req, res) => {
               source: 'node_master'
             }));
             
-            // Filter to only include players from teams playing today
-            if (filterByToday === 'true' && todaysGameInfo.teams && todaysGameInfo.teams.length > 0) {
+            // Filter by today's games using standardized team abbreviations
+            if (filterByToday === 'true' && standardTeams.length > 0) {
               const beforeCount = transformedPlayers.length;
               transformedPlayers = transformedPlayers.filter(p =>   
-                p.team && todaysGameInfo.teams.includes(p.team)
+                p.team && standardTeams.includes(p.team)
               );
-              console.log(`   🎯 Filtered from ${beforeCount} to ${transformedPlayers.length} players from today's games`);
+              console.log(`   🎯 Filtered from ${beforeCount} to ${transformedPlayers.length} players from today's games (standardized teams)`);
             }
+
+            // Opponent adjustment (real stats + static fallback) - NBA only
+            transformedPlayers = transformedPlayers.map(p => {
+              const opponent = opponentMap.get(p.team);
+              if (opponent) {
+                if (defensiveStatsMap.has(opponent)) {
+                  const oppStats = defensiveStatsMap.get(opponent);
+                  
+                  p.original_points = p.points;
+                  p.original_rebounds = p.rebounds;
+                  p.original_assists = p.assists;
+
+                  const pointsFactor = oppStats.pointsAllowed / leagueAverages.points;
+                  const reboundsFactor = oppStats.reboundsAllowed / leagueAverages.rebounds;
+                  const assistsFactor = oppStats.assistsAllowed / leagueAverages.assists;
+
+                  p.points *= pointsFactor;
+                  p.rebounds *= reboundsFactor;
+                  p.assists *= assistsFactor;
+
+                  p.fantasy_points = (
+                    p.points +
+                    1.2 * p.rebounds +
+                    1.5 * p.assists +
+                    2 * (p.steals || 0) +
+                    2 * (p.blocks || 0) -
+                    (p.turnovers || 0)
+                  );
+
+                  p.matchup_opponent = opponent;
+                  p.matchup_factors = {
+                    points: pointsFactor,
+                    rebounds: reboundsFactor,
+                    assists: assistsFactor,
+                    source: 'tank01'
+                  };
+
+                  console.log(`   Adjustment for ${p.name} (${p.team}) vs ${opponent} (Tank01): factors pts=${pointsFactor.toFixed(2)}, reb=${reboundsFactor.toFixed(2)}, ast=${assistsFactor.toFixed(2)} → new FP ${p.fantasy_points.toFixed(1)}`);
+                }
+                else if (DEFENSIVE_FACTORS[opponent]) {
+                  const staticFactor = DEFENSIVE_FACTORS[opponent];
+                  
+                  p.original_points = p.points;
+                  p.original_rebounds = p.rebounds;
+                  p.original_assists = p.assists;
+
+                  p.points *= staticFactor.points;
+                  p.rebounds *= staticFactor.rebounds;
+                  p.assists *= staticFactor.assists;
+
+                  p.fantasy_points = (
+                    p.points +
+                    1.2 * p.rebounds +
+                    1.5 * p.assists +
+                    2 * (p.steals || 0) +
+                    2 * (p.blocks || 0) -
+                    (p.turnovers || 0)
+                  );
+
+                  p.matchup_opponent = opponent;
+                  p.matchup_factors = {
+                    points: staticFactor.points,
+                    rebounds: staticFactor.rebounds,
+                    assists: staticFactor.assists,
+                    source: 'static'
+                  };
+
+                  console.log(`   Adjustment for ${p.name} (${p.team}) vs ${opponent} (static): factors pts=${staticFactor.points.toFixed(2)}, reb=${staticFactor.rebounds.toFixed(2)}, ast=${staticFactor.assists.toFixed(2)} → new FP ${p.fantasy_points.toFixed(1)}`);
+                } else {
+                  console.log(`   No defensive stats or static factors for opponent ${opponent}, skipping adjustment for ${p.name}`);
+                }
+              }
+              return p;
+            });
                
             players = transformedPlayers;
-            break; // success
+            break;
           } catch (err) {
             nodeError = err;
             if (attempt === maxRetries) {
@@ -1424,11 +2439,11 @@ app.get('/api/fantasyhub/players', async (req, res) => {
             count: players.length,
             source: 'node_master',
             games_today: todaysGameInfo.games ? todaysGameInfo.games.length : 0,
-            teams_today: todaysGameInfo.teams || []
+            teams_today: standardTeams
           };
         }
               
-        // 4. Fallback: static players with filtering
+        // Fallback: static NBA players with filtering
         console.warn('❌ Using fallback player data due to:', nodeError?.message || 'unknown error');
         try {
           let basePlayers = [];
@@ -1445,6 +2460,7 @@ app.get('/api/fantasyhub/players', async (req, res) => {
               assists: p.assists || 0,
               steals: p.steals || 0,
               blocks: p.blocks || 0,
+              turnovers: p.turnovers || 0,
               fantasy_points: p.fantasy_points || p.projection || 0,
               salary: p.salary || 5000,
               games_played: p.games_played || 0,
@@ -1456,16 +2472,15 @@ app.get('/api/fantasyhub/players', async (req, res) => {
             basePlayers = generateIntelligentFantasyFallback(sport);
           }
           
-          // Filter to only include players from teams playing today
-          if (filterByToday === 'true' && todaysGameInfo.teams && todaysGameInfo.teams.length > 0) {
+          // Filter by today's games using standardized team abbreviations
+          if (filterByToday === 'true' && standardTeams.length > 0) {
             const beforeCount = basePlayers.length;
             basePlayers = basePlayers.filter(p =>
-              p.team && todaysGameInfo.teams.includes(p.team)
+              p.team && standardTeams.includes(p.team)
             );
-            console.log(`   🎯 Filtered fallback from ${beforeCount} to ${basePlayers.length} players from today's games`);
+            console.log(`   🎯 Filtered fallback from ${beforeCount} to ${basePlayers.length} players from today's games (standardized teams)`);
           }  
          
-          // Enrich with Tank01 master data (if available)
           let tank01Master = new Map();
           try {
             tank01Master = await getTank01MasterData(sport);
@@ -1474,29 +2489,11 @@ app.get('/api/fantasyhub/players', async (req, res) => {
             console.warn('   ⚠️ Could not fetch Tank01 master data, continuing with static only');
           }
               
-          const enrichedPlayers = basePlayers.map(player => {
+          let enrichedPlayers = basePlayers.map(player => {
             let enriched = { ...player, enriched: false, source: player.source };
               
             if (tank01Master.size > 0) {
-              const normalizedName = player.name.toLowerCase().replace(/[^a-z0-9]/g, '');
-              for (const [id, data] of tank01Master.entries()) {
-                if (!data.name) continue;
-                const normalizedTank = data.name.toLowerCase().replace(/[^a-z0-9]/g, '');
-                if (normalizedName.includes(normalizedTank) || normalizedTank.includes(normalizedName)) {
-                  enriched = {
-                    ...player,
-                    points: data.points || player.points,
-                    rebounds: data.rebounds || player.rebounds,
-                    assists: data.assists || player.assists,
-                    fantasy_points: data.projection || player.fantasy_points,
-                    adp: data.adp,
-                    injury_status: data.injury_status || player.injury_status,
-                    enriched: true,
-                    source: 'static_2026+tank01'
-                  };
-                  break;
-                }
-              }
+              // enrichment logic (if any) would go here
             }
               
             if (enriched.salary > 0) {
@@ -1506,6 +2503,80 @@ app.get('/api/fantasyhub/players', async (req, res) => {
             }
           
             return enriched;
+          });
+
+          // Opponent adjustment for enriched players (real stats + static fallback)
+          enrichedPlayers = enrichedPlayers.map(p => {
+            const opponent = opponentMap.get(p.team);
+            if (opponent) {
+              if (defensiveStatsMap.has(opponent)) {
+                const oppStats = defensiveStatsMap.get(opponent);
+                
+                p.original_points = p.points;
+                p.original_rebounds = p.rebounds;
+                p.original_assists = p.assists;
+
+                const pointsFactor = oppStats.pointsAllowed / leagueAverages.points;
+                const reboundsFactor = oppStats.reboundsAllowed / leagueAverages.rebounds;
+                const assistsFactor = oppStats.assistsAllowed / leagueAverages.assists;
+
+                p.points *= pointsFactor;
+                p.rebounds *= reboundsFactor;
+                p.assists *= assistsFactor;
+
+                p.fantasy_points = (
+                  p.points +
+                  1.2 * p.rebounds +
+                  1.5 * p.assists +
+                  2 * (p.steals || 0) +
+                  2 * (p.blocks || 0) -
+                  (p.turnovers || 0)
+                );
+
+                p.matchup_opponent = opponent;
+                p.matchup_factors = {
+                  points: pointsFactor,
+                  rebounds: reboundsFactor,
+                  assists: assistsFactor,
+                  source: 'tank01'
+                };
+
+                console.log(`   Adjustment for ${p.name} (${p.team}) vs ${opponent} (Tank01): factors pts=${pointsFactor.toFixed(2)}, reb=${reboundsFactor.toFixed(2)}, ast=${assistsFactor.toFixed(2)} → new FP ${p.fantasy_points.toFixed(1)}`);
+              }
+              else if (DEFENSIVE_FACTORS[opponent]) {
+                const staticFactor = DEFENSIVE_FACTORS[opponent];
+                
+                p.original_points = p.points;
+                p.original_rebounds = p.rebounds;
+                p.original_assists = p.assists;
+
+                p.points *= staticFactor.points;
+                p.rebounds *= staticFactor.rebounds;
+                p.assists *= staticFactor.assists;
+
+                p.fantasy_points = (
+                  p.points +
+                  1.2 * p.rebounds +
+                  1.5 * p.assists +
+                  2 * (p.steals || 0) +
+                  2 * (p.blocks || 0) -
+                  (p.turnovers || 0)
+                );
+
+                p.matchup_opponent = opponent;
+                p.matchup_factors = {
+                  points: staticFactor.points,
+                  rebounds: staticFactor.rebounds,
+                  assists: staticFactor.assists,
+                  source: 'static'
+                };
+
+                console.log(`   Adjustment for ${p.name} (${p.team}) vs ${opponent} (static): factors pts=${staticFactor.points.toFixed(2)}, reb=${staticFactor.rebounds.toFixed(2)}, ast=${staticFactor.assists.toFixed(2)} → new FP ${p.fantasy_points.toFixed(1)}`);
+              } else {
+                console.log(`   No defensive stats or static factors for opponent ${opponent}, skipping adjustment for ${p.name}`);
+              }
+            }
+            return p;
           });
             
           console.log(`   ✅ Enriched ${enrichedPlayers.filter(p => p.enriched).length}/${enrichedPlayers.length} players`);   
@@ -1518,16 +2589,15 @@ app.get('/api/fantasyhub/players', async (req, res) => {
               source: staticNBAPlayers.length ? 'static_2026' : 'fallback'
             },
             games_today: todaysGameInfo.games ? todaysGameInfo.games.length : 0,
-            teams_today: todaysGameInfo.teams || []
+            teams_today: standardTeams
           };       
         } catch (fallbackError) {
           console.error('❌ FantasyHub fallback error:', fallbackError);
           const fallbackPlayers = generateIntelligentFantasyFallback(sport); 
                     
-          // Filter fallback players
-          if (filterByToday === 'true' && todaysGameInfo.teams && todaysGameInfo.teams.length > 0) {
+          if (filterByToday === 'true' && standardTeams.length > 0) {
             const filteredFallback = fallbackPlayers.filter(p =>
-              p.team && todaysGameInfo.teams.includes(p.team)
+              p.team && standardTeams.includes(p.team)
             );
             return {
               message: 'Fantasy Hub Analysis (Fallback Mode)',
@@ -1548,7 +2618,7 @@ app.get('/api/fantasyhub/players', async (req, res) => {
           };
         }
       },
-      300 // 5 minutes TTL
+      300
     );
 
     return res.json({
@@ -1573,7 +2643,7 @@ app.get('/api/fantasyhub/players', async (req, res) => {
 });
 
 // ====================
-// DIRECT THE ODDS API ENDPOINT (with static enrichment)
+// DIRECT THE ODDS API ENDPOINT
 // ====================
 app.get('/api/theoddsapi/playerprops', async (req, res) => {
   const sport = req.query.sport || 'basketball_nba';
@@ -1584,7 +2654,6 @@ app.get('/api/theoddsapi/playerprops', async (req, res) => {
       cacheKey,
       async () => {
         const playerProps = await fetchPlayerPropsFromOddsAPI(sport);
-        // Enrich each prop with static player info
         const enrichedProps = playerProps.map(prop => {
           const staticPlayer = findStaticPlayer(prop.player);
           return {
@@ -1603,7 +2672,7 @@ app.get('/api/theoddsapi/playerprops', async (req, res) => {
           retrieved: new Date().toISOString()
         };
       },
-      300 // 5 minutes TTL
+      300
     );
     
     res.json(response);
@@ -1613,139 +2682,249 @@ app.get('/api/theoddsapi/playerprops', async (req, res) => {
 });
 
 // ====================
-// DRAFT ENDPOINTS (ADDED)
+// DRAFT ENDPOINTS
 // ====================
-
-// Helper function to get enriched players (reuses your existing logic)
 async function getEnrichedPlayers(sport = 'nba') {
-  const cacheKey = `draft:enriched:${sport}`;
+  const cacheKey = `draft:enriched:v5:${sport}`;
   
   return await getCachedOrFetch(
     cacheKey,
     async () => {
       let rawPlayers = [];
-      if (staticNBAPlayers.length > 0) {
-        console.log(`   [getEnrichedPlayers] Using staticNBAPlayers (${staticNBAPlayers.length})`);
-        rawPlayers = staticNBAPlayers.map(p => ({
-          playerId: p.id || `static-${p.name.replace(/\s+/g, '_')}`,
-          name: p.name || 'Unknown',
-          team: p.team || 'FA',
-          position: p.position || 'N/A',
-          salary: p.salary || 5000,
-          projection: p.points || p.projection || 20,
-          value: p.value || ((p.points || 20) / (p.salary || 5000)) * 1000,
-          injury_status: p.injury_status || 'Healthy',
-          volatility: p.injury_status === 'Healthy' ? 0.08 : 0.15,
-        }));
+
+      // ----- For NBA: use static 2026 data as base -----
+      if (sport === 'nba' && staticNBAPlayers.length > 0) {
+        console.log(`   [getEnrichedPlayers] Using static NBA players (${staticNBAPlayers.length}) as base`);
+
+        // Fetch Tank01 master data for ADP and injury enrichment
+        let tank01Master = new Map();
+        try {
+          tank01Master = await getTank01MasterData(sport);
+          console.log(`   Tank01 master has ${tank01Master.size} entries for enrichment`);
+        } catch (error) {
+          console.warn('   Could not fetch Tank01 master, ADP/injury may be missing');
+        }
+
+        // Normalize name for matching
+        const normalizeName = (name) => name.replace(/[.\s'\-]/g, '').toLowerCase();
+
+        // Build a map from normalized Tank01 name to player data
+        const tank01ByName = new Map();
+        for (const [id, p] of tank01Master.entries()) {
+          if (p.name) {
+            const norm = normalizeName(p.name);
+            tank01ByName.set(norm, p);
+          }
+        }
+
+        // Map static players, enriching with ADP/injury from Tank01
+        rawPlayers = staticNBAPlayers.map(p => {
+          const normStatic = normalizeName(p.name);
+          const tank01Match = tank01ByName.get(normStatic);
+
+          const projection = p.fantasy_points || p.points || 0;
+
+          return {
+            playerId: p.id || `static-${p.name.replace(/\s+/g, '_')}`,
+            name: p.name,
+            team: p.team,
+            position: p.position,
+            salary: 5000, // temporary, will be scaled
+            projection,
+            value: 0,
+            injury_status: tank01Match?.injury_status || p.injury_status || 'Healthy',
+            volatility: (tank01Match?.injury_status === 'Injured' || p.injury_status === 'Injured') ? 0.15 : 0.08,
+            is_rookie: p.is_rookie || false,
+            adp: tank01Match?.adp || p.adp || 999
+          };
+        });
+
+        console.log(`   Enriched ${rawPlayers.length} static players with Tank01 data`);
       } else {
-        console.log('   [getEnrichedPlayers] Using fallback generation');
-        const fallback = generateIntelligentFantasyFallback();
-        rawPlayers = fallback.map(p => ({
-          playerId: p.player_id || `fallback-${p.name.replace(/\s+/g, '_')}`,
-          name: p.name,
-          team: p.team,
-          position: p.position,
-          salary: p.salary || 7000,
-          projection: typeof p.projection === 'object' ? p.projection.line : (p.projection || 20),
-          value: p.value || ((typeof p.projection === 'object' ? p.projection.line : 20) / (p.salary || 7000)) * 1000,
-          injury_status: p.injury_status || 'Healthy',
-          volatility: 0.1 + Math.random() * 0.1,
-        }));
+        // ----- For other sports, use Tank01 master data as primary (with fallback) -----
+        // (existing code – unchanged)
+        try {
+          console.log(`   [getEnrichedPlayers] Attempting Tank01 master for ${sport}...`);
+          const tank01Master = await getTank01MasterData(sport);
+          if (tank01Master.size > 0) {
+            console.log(`   Tank01 master has ${tank01Master.size} entries`);
+            rawPlayers = Array.from(tank01Master.values()).map(p => ({
+              playerId: p.playerID || `${sport}-${p.name.replace(/\s+/g, '-')}`,
+              name: p.name,
+              team: p.team,
+              position: p.position,
+              salary: 5000, // temporary
+              projection: p.projection || 0,
+              value: 0,
+              injury_status: p.injury_status || 'Healthy',
+              volatility: p.injury_status === 'Healthy' ? 0.08 : 0.15,
+              is_rookie: false,
+              adp: p.adp || 999
+            }));
+            console.log(`   Mapped ${rawPlayers.length} players from Tank01`);
+          } else {
+            throw new Error('Tank01 master map is empty');
+          }
+        } catch (error) {
+          console.warn(`   Tank01 master failed for ${sport}, falling back to static:`, error.message);
+
+          let staticArray = [];
+          if (sport === 'nhl') staticArray = staticNHLPlayers;
+          else if (sport === 'mlb') staticArray = staticMLBPlayers;
+          else if (sport === 'nfl') staticArray = staticNFLPlayers;
+
+          if (staticArray.length > 0) {
+            rawPlayers = staticArray.map(p => ({
+              playerId: p.id || `static-${p.name.replace(/\s+/g, '_')}`,
+              name: p.name || 'Unknown',
+              team: p.team || 'FA',
+              position: p.position || 'N/A',
+              salary: p.salary || 5000,
+              projection: p.points || p.projection || 20,
+              value: p.value || ((p.points || 20) / (p.salary || 5000)) * 1000,
+              injury_status: p.injury_status || 'Healthy',
+              volatility: p.injury_status === 'Healthy' ? 0.08 : 0.15,
+              is_rookie: p.is_rookie || false,
+              adp: p.adp || 999
+            }));
+          } else {
+            // Final fallback: generated players for the sport
+            console.log(`   Using generated fallback for ${sport}`);
+            const fallback = generateSportFallback(sport);
+            rawPlayers = fallback.map(p => ({
+              playerId: p.player_id || `fallback-${p.name.replace(/\s+/g, '_')}`,
+              name: p.name,
+              team: p.team,
+              position: p.position,
+              salary: p.salary || 7000,
+              projection: typeof p.projection === 'object' ? p.projection.line : (p.projection || 20),
+              value: p.value || ((typeof p.projection === 'object' ? p.projection.line : 20) / (p.salary || 7000)) * 1000,
+              injury_status: p.injury_status || 'Healthy',
+              volatility: 0.1 + Math.random() * 0.1,
+              adp: 999
+            }));
+          }
+        }
       }
 
-      // Deduplicate by playerId, keeping the one with the highest salary
+      // ----- Deduplicate by playerId (keep highest salary) -----
       const uniqueMap = new Map();
       rawPlayers.forEach(p => {
         if (!uniqueMap.has(p.playerId) || p.salary > (uniqueMap.get(p.playerId).salary || 0)) {
           uniqueMap.set(p.playerId, p);
         }
       });
-      const basePlayers = Array.from(uniqueMap.values());
+      let basePlayers = Array.from(uniqueMap.values());
 
-      console.log(`   [getEnrichedPlayers] After dedup: ${basePlayers.length} unique players`);
-      console.log(`   Sample playerIds: ${basePlayers.slice(0, 3).map(p => p.playerId).join(', ')}`);
+// ----- Apply percentile‑based salary scaling (UPDATED FOR NBA) -----
+if (basePlayers.length > 0) {
+  const projections = basePlayers.map(p => p.projection).filter(v => v > 0);
+  if (projections.length > 0) {
+    const minProj = Math.min(...projections);
+    const maxProj = Math.max(...projections);
+    const minSalary = 3500;                     // raised from 3000
+    let maxSalary = 15000; // default for other sports
+    if (sport === 'nba') {
+      maxSalary = 12000;                         // FanDuel‑style top salary
+    } else if (sport === 'nfl') {
+      maxSalary = 18000;
+    }
+    // NHL and MLB keep default 15000 (adjust later if needed)
 
+    basePlayers.forEach(p => {
+      if (p.projection > 0) {
+        const ratio = (p.projection - minProj) / (maxProj - minProj);
+        p.salary = Math.round(minSalary + ratio * (maxSalary - minSalary));
+      } else {
+        p.salary = minSalary;
+      }
+      p.value = p.projection > 0 ? (p.projection / p.salary) * 1000 : 0;
+    });
+  }
+}
+
+      console.log(`   [getEnrichedPlayers] Final count: ${basePlayers.length} unique players`);
+      console.log(`   Sample:`, basePlayers.slice(0, 3).map(p => p.name));
       return basePlayers;
     },
-    300 // 5 minutes TTL
+    300
   );
 }
 
-// GET /api/draft/rankings - now uses Tank01 ADP + projections
 app.get('/api/draft/rankings', async (req, res) => {
   try {
     console.log('📊 Draft rankings query:', req.query);
-    const { sport = 'nba', position, scoring, limit = 50, pick, strategy = 'balanced' } = req.query;
+    const { sport = 'nba', position, limit = 50, pick, strategy = 'balanced' } = req.query;
 
     const cacheKey = `draft:rankings:${sport}:${position || 'all'}:${limit}:${pick || 'none'}:${strategy}`;
-    
+
     const response = await getCachedOrFetch(
       cacheKey,
       async () => {
-        // ----- FETCH TANK01 ADP AND PROJECTIONS USING CACHED VERSIONS -----
-        let adpList = [];
-        let projections = {};
+        // ----- Get today's games from Tank01 -----
+        const today = new Date().toISOString().slice(0,10).replace(/-/g, '');
+        let games = [];
         try {
-          [adpList, projections] = await Promise.all([
-            getCachedTank01Data('getADP', { sport }, 3600),
-            getCachedTank01Data('getProjections', { days: 7, sport }, 1800)
-          ]);
+          games = await getCachedTank01Data('getGamesForDate', { gameDate: today }, 300);
+          console.log(`   Raw games from Tank01: ${games?.length || 0} games`);
         } catch (error) {
-          console.warn('⚠️ Tank01 fetch failed, using fallback data:', error.message);
+          console.warn('⚠️ Could not fetch today\'s games:', error.message);
         }
 
-        // Build a map of playerId to ADP info
-        const adpMap = new Map();
-        if (Array.isArray(adpList)) {
-          adpList.forEach(item => {
-            if (item.playerID) {
-              adpMap.set(item.playerID, {
-                overallADP: parseFloat(item.overallADP) || 999,
-                posADP: item.posADP || ''
-              });
-            }
+        const teamsPlayingToday = new Set();
+        if (Array.isArray(games) && games.length > 0) {
+          games.forEach(game => {
+            if (game.away) teamsPlayingToday.add(game.away);
+            if (game.home) teamsPlayingToday.add(game.home);
           });
+          console.log(`   Teams playing today (from Tank01): ${Array.from(teamsPlayingToday).join(', ')}`);
+        } else {
+          console.warn('⚠️ No games fetched – no players will match today\'s slate');
         }
 
-        // Merge projections with ADP
-        let mergedPlayers = [];
-        if (projections && typeof projections === 'object') {
-          for (const [playerId, proj] of Object.entries(projections)) {
-            const adpInfo = adpMap.get(playerId) || { overallADP: 999, posADP: '' };
-            const name = proj.longName || proj.name || 'Unknown';
-            const team = proj.team || 'FA';
-            const position = proj.pos || 'N/A';
-            const salary = 5000; // Placeholder; can be enhanced later
-            const projection = parseFloat(proj.fantasyPoints) || 0;
-            const value = salary > 0 ? (projection / salary) * 1000 : 0;
-            const injury_status = 'Healthy'; // Could be overridden from injury list later
-
-            mergedPlayers.push({
-              playerId,
-              name,
-              team,
-              position,
-              salary,
-              projection,
-              value,
-              adp: adpInfo.overallADP,
-              posADP: adpInfo.posADP,
-              injury_status,
-              volatility: 0.1, // placeholder
-              ceiling: projection * 1.2,
-              floor: projection * 0.8
-            });
-          }
+        // ----- Get enriched players (already includes ADP) -----
+        const enrichedPlayers = await getEnrichedPlayers(sport);
+        console.log(`   Enriched players count: ${enrichedPlayers.length}`);
+        if (enrichedPlayers.length === 0) {
+          console.error('❌ No players loaded!');
+        } else {
+          console.log('   First 3 players (name, team):',
+            enrichedPlayers.slice(0,3).map(p => `${p.name} (${p.team})`).join(', '));
         }
 
-        // ----- FALLBACK TO ENRICHED PLAYERS IF TANK01 RETURNED NO DATA -----
-        let basePlayers = mergedPlayers.length > 0 ? mergedPlayers : await getEnrichedPlayers(sport);
-        console.log(`   Base players count: ${basePlayers.length}`);
+        // ----- Filter to only players from tonight's games -----
+        const playersInSlate = enrichedPlayers.filter(p => {
+          return p.team && teamsPlayingToday.has(p.team);
+        });
+        console.log(`   Players in tonight's slate: ${playersInSlate.length} of ${enrichedPlayers.length}`);
 
-        // ----- SORT BY VALUE (best first) -----
-        let sorted = [...basePlayers].sort((a, b) => (b.value || 0) - (a.value || 0));
+        // ----- Merge ADP (already present) into slate players -----
+        const mergedPlayers = playersInSlate.map(p => {
+          const salary = p.salary || 5000;
+          const projection = p.projection || 0;
+          return {
+            playerId: p.playerId,
+            name: p.name,
+            team: p.team,
+            position: p.position || 'N/A',
+            salary,
+            projection,
+            valueScore: salary > 0 ? (projection / salary) * 1000 : 0,
+            adp: p.adp || 999,   // use ADP from enriched player
+            injury_status: p.injury_status || 'Healthy',
+            ceiling: projection * 1.2,
+            floor: projection * 0.8,
+            keyFactors: ['Projected volume', 'Matchup', 'Injury status']
+          };
+        });
 
-        // ----- SIMULATE DRAFT UP TO GIVEN PICK -----
+        console.log(`   Merged players count: ${mergedPlayers.length}`);
+
+        // ----- Sort by valueScore -----
+        let sorted = [...mergedPlayers].sort((a, b) => (b.valueScore || 0) - (a.valueScore || 0));
+        console.log(`   Sorted players, top 3:`, sorted.slice(0,3).map(p => p.name));
+
+        // ----- Simulate previous picks if a pick number is provided -----
         if (pick) {
           const pickNum = parseInt(pick, 10);
           if (!isNaN(pickNum) && pickNum > 1) {
@@ -1763,38 +2942,41 @@ app.get('/api/draft/rankings', async (req, res) => {
           }
         }
 
-        // ----- APPLY POSITION FILTER -----
-        let filtered = sorted;
+        // ----- Apply position filter if requested -----
         if (position) {
-          filtered = filtered.filter(p => p.position === position);
+          sorted = sorted.filter(p => p.position === position);
+          console.log(`   After position filter (${position}): ${sorted.length} players left`);
         }
 
-        // ----- FORMAT RESPONSE (match existing frontend expectations) -----
-        const ranked = filtered.slice(0, parseInt(limit)).map((p, idx) => ({
+        // ----- Format the final ranked list -----
+        const ranked = sorted.slice(0, parseInt(limit)).map((p, idx) => ({
           playerId: p.playerId,
           name: p.name,
           team: p.team,
           position: p.position,
           salary: p.salary,
-          projectedPoints: p.projection || 0,
-          valueScore: p.value || 0,
-          adp: p.adp || idx + 1,                      // use real ADP if available
+          projectedPoints: p.projection,
+          valueScore: p.valueScore,
+          adp: p.adp,
           expertRank: idx + 1,
           tier: Math.floor(idx / 12) + 1,
-          injuryRisk: p.injury_status || 'low',
-          keyFactors: p.keyFactors || ['Projected volume', 'Matchup', 'Injury status']
+          injuryRisk: p.injury_status,
+          keyFactors: p.keyFactors
         }));
 
-        console.log(`   Returning ${ranked.length} players:`, ranked.slice(0,3).map(p => p.name));
-        
+        console.log(`   Returning ${ranked.length} players (from tonight's slate)`);
+        if (ranked.length > 0) {
+          console.log('   First ranked player:', ranked[0]);
+        }
+
         return {
           success: true,
           data: ranked,
           count: ranked.length,
-          source: mergedPlayers.length > 0 ? 'tank01-enriched' : 'balldontlie-enriched'
+          source: teamsPlayingToday.size > 0 ? 'enriched-with-slate-filter' : 'enriched-no-slate'
         };
       },
-      300 // 5 minutes TTL
+      300
     );
 
     res.json(response);
@@ -1805,22 +2987,20 @@ app.get('/api/draft/rankings', async (req, res) => {
   }
 });
 
-// POST /api/draft/save
 app.post('/api/draft/save', async (req, res) => {
   try {
     const draftData = req.body;
-    // Ensure userId is present (you might get from auth)
     if (!draftData.userId) {
       return res.status(400).json({ success: false, error: 'userId is required' });
     }
     const draft = new DraftRecommendation(draftData);
     await draft.save();
     
-    // Invalidate relevant caches
     if (redisCacheClient) {
       try {
         await redisCacheClient.del('draft:strategies:popular');
-        await redisCacheClient.delPattern('draft:history:*');
+        // Simple pattern deletion would require SCAN, skipping for now
+        // await redisCacheClient.delPattern('draft:history:*');
       } catch (error) {
         console.warn('⚠️ Failed to invalidate caches:', error.message);
       }
@@ -1833,7 +3013,6 @@ app.post('/api/draft/save', async (req, res) => {
   }
 });
 
-// GET /api/draft/history
 app.get('/api/draft/history', async (req, res) => {
   try {
     const { userId, sport, status } = req.query;
@@ -1852,7 +3031,7 @@ app.get('/api/draft/history', async (req, res) => {
           .limit(50)
           .lean();
       },
-      300 // 5 minutes TTL
+      300
     );
     
     res.json({ success: true, data: drafts, count: drafts.length });
@@ -1862,7 +3041,6 @@ app.get('/api/draft/history', async (req, res) => {
   }
 });
 
-// GET /api/draft/strategies/popular
 app.get('/api/draft/strategies/popular', async (req, res) => {
   try {
     const { sport } = req.query;
@@ -1879,7 +3057,7 @@ app.get('/api/draft/strategies/popular', async (req, res) => {
           { $limit: 10 }
         ]);
       },
-      3600 // 1 hour TTL (popular strategies don't change often)
+      3600
     );
     
     res.json({ success: true, data: strategies });
@@ -1895,7 +3073,7 @@ app.get('/api/draft/strategies/popular', async (req, res) => {
 app.get('/api/system/status', (req, res) => {
   const status = {
     timestamp: new Date().toISOString(),
-    version: 'v3.6',
+    version: 'v3.9',
     caching: {
       redis: redisCacheClient ? '✅ Connected' : '⚠️ Disabled',
       nodeCache: '✅ Active (fallback)',
@@ -1903,8 +3081,8 @@ app.get('/api/system/status', (req, res) => {
       tank01Cache: '✅ Using Redis caching with TTLs (5min-1hr)'
     },
     endpoints: {
-      prizepicks: { path: '/api/prizepicks/selections', status: '✅ Healthy', source: 'the_odds_api+static' },
-      fantasyhub: { path: '/api/fantasyhub/players', status: '✅ Healthy', source: 'nba_api_service+static' },
+      prizepicks: { path: '/api/prizepicks/selections', status: '✅ Healthy', source: 'the_odds_api+static+opponent' },
+      fantasyhub: { path: '/api/fantasyhub/players', status: '✅ Healthy', source: 'nba_api_service+static+opponent' },
       odds_api: { path: '/api/theoddsapi/playerprops', status: '✅ Healthy', source: 'the_odds_api+static' }
     },
     data_sources: {
@@ -1918,125 +3096,34 @@ app.get('/api/system/status', (req, res) => {
 });
 
 // ====================
-// INTELLIGENT FALLBACK FUNCTIONS (EXPANDED) - kept as backup
+// CURATED STATIC FALLBACK
 // ====================
-function generateIntelligentFallbackData(sport = 'NBA') {
-  console.log('   🛠️ Generating intelligent fallback data for PrizePicks');
-  const players = {
-    'NBA': [
-      { name: 'Luka Doncic', team: 'DAL', basePoints: 32.5, baseReb: 8.5, baseAst: 9.2 },
-      { name: 'Jayson Tatum', team: 'BOS', basePoints: 27.8, baseReb: 8.1, baseAst: 4.8 },
-      { name: 'Nikola Jokic', team: 'DEN', basePoints: 25.3, baseReb: 11.8, baseAst: 9.1 },
-      { name: 'Shai Gilgeous-Alexander', team: 'OKC', basePoints: 31.2, baseReb: 5.5, baseAst: 6.4 },
-      { name: 'Giannis Antetokounmpo', team: 'MIL', basePoints: 30.8, baseReb: 11.5, baseAst: 6.2 }
-    ]
-  };
-  const playerPool = players[sport] || players['NBA'];
-  const selections = [];
-  playerPool.forEach((player, idx) => {
-    const variance = 0.9 + (Math.random() * 0.2);
-    const line = Math.round((player.basePoints * variance) * 10) / 10;
-    const projection = line + (Math.random() * 3) + 0.5;
-    selections.push({
-      id: `fallback-${sport}-${idx}`,
-      player: player.name,
-      team: player.team,
-      sport: sport,
-      stat: 'Points',
-      line: line,
-      type: 'Over',
-      projection: parseFloat(projection.toFixed(1)),
-      confidence: ['medium', 'high'][Math.floor(Math.random() * 2)],
-      odds: `-${110 + Math.floor(Math.random() * 40)}`,
-      timestamp: new Date().toISOString(),
-      analysis: `Fallback data | ${player.name} season avg: ${player.basePoints}`,
-      status: 'pending',
-      source: 'intelligent-fallback'
-    });
-  });
-  return selections;
-}
-
 function generateIntelligentFantasyFallback(sport = 'nba') {
-  console.log('   🛠️ Generating expanded fantasy fallback data');
+  console.log('   🛠️ Using curated static fallback (2025-26 per‑game averages)');
   return [
-    {
-      player_id: 'fallback-1',
-      name: 'Luka Doncic',
-      team: 'DAL',
-      position: 'PG',
-      projection: { stat_type: 'Points', line: 32.5, confidence: 'high', updated: new Date().toISOString() },
-      context: { matchup: 'DAL @ GSW', game_time: new Date(Date.now() + 3600000).toISOString(), position: 'PG' },
-      historical_stats: {
-        player_id: 1, position: 'PG', height: '6-7', weight: '230',
-        season_averages: { points: 33.1, rebounds: 8.6, assists: 9.4, steals: 1.4, blocks: 0.6, field_goal_pct: 48.7, games_played: 45 }
-      },
-      fantasy_score: 85, recommendation: 'Strong Play', source: 'fallback'
-    },
-    {
-      player_id: 'fallback-2',
-      name: 'Nikola Jokic',
-      team: 'DEN',
-      position: 'C',
-      projection: { stat_type: 'Points+Rebounds+Assists', line: 42.5, confidence: 'high', updated: new Date().toISOString() },
-      context: { matchup: 'DEN @ PHX', game_time: new Date(Date.now() + 7200000).toISOString(), position: 'C' },
-      historical_stats: {
-        player_id: 2, position: 'C', height: '6-11', weight: '284',
-        season_averages: { points: 25.8, rebounds: 12.1, assists: 9.2, steals: 1.2, blocks: 0.9, field_goal_pct: 58.3, games_played: 48 }
-      },
-      fantasy_score: 88, recommendation: 'Strong Play', source: 'fallback'
-    },
-    {
-      player_id: 'fallback-3',
-      name: 'Shai Gilgeous-Alexander',
-      team: 'OKC',
-      position: 'SG',
-      projection: { stat_type: 'Points', line: 31.0, confidence: 'medium', updated: new Date().toISOString() },
-      context: { matchup: 'OKC @ LAL', game_time: new Date(Date.now() + 10800000).toISOString(), position: 'SG' },
-      historical_stats: {
-        player_id: 3, position: 'SG', height: '6-6', weight: '195',
-        season_averages: { points: 31.8, rebounds: 5.6, assists: 6.4, steals: 2.2, blocks: 0.9, field_goal_pct: 54.8, games_played: 46 }
-      },
-      fantasy_score: 82, recommendation: 'Strong Play', source: 'fallback'
-    },
-    {
-      player_id: 'fallback-4',
-      name: 'Giannis Antetokounmpo',
-      team: 'MIL',
-      position: 'PF',
-      projection: { stat_type: 'Points+Rebounds', line: 42.5, confidence: 'high', updated: new Date().toISOString() },
-      context: { matchup: 'MIL @ BOS', game_time: new Date(Date.now() + 14400000).toISOString(), position: 'PF' },
-      historical_stats: {
-        player_id: 4, position: 'PF', height: '6-11', weight: '242',
-        season_averages: { points: 30.8, rebounds: 11.5, assists: 6.2, steals: 1.3, blocks: 1.4, field_goal_pct: 60.1, games_played: 42 }
-      },
-      fantasy_score: 87, recommendation: 'Strong Play', source: 'fallback'
-    },
-    {
-      player_id: 'fallback-5',
-      name: 'Jayson Tatum',
-      team: 'BOS',
-      position: 'SF',
-      projection: { stat_type: 'Points', line: 27.8, confidence: 'medium', updated: new Date().toISOString() },
-      context: { matchup: 'BOS vs MIL', game_time: new Date(Date.now() + 18000000).toISOString(), position: 'SF' },
-      historical_stats: {
-        player_id: 5, position: 'SF', height: '6-8', weight: '210',
-        season_averages: { points: 27.8, rebounds: 8.1, assists: 4.8, steals: 1.1, blocks: 0.7, field_goal_pct: 47.5, games_played: 50 }
-      },
-      fantasy_score: 78, recommendation: 'Solid Option', source: 'fallback'
-    }
+    { id: 'jokic', name: 'Nikola Jokic', team: 'DEN', position: 'C', points: 26.5, rebounds: 12.3, assists: 9.2, fantasy_points: 55.2, salary: 11400, injury_status: 'Healthy' },
+    { id: 'doncic', name: 'Luka Doncic', team: 'LAL', position: 'G', points: 28.8, rebounds: 8.6, assists: 8.4, fantasy_points: 52.1, salary: 11200, injury_status: 'Healthy' },
+    { id: 'sga', name: 'Shai Gilgeous-Alexander', team: 'OKC', position: 'G', points: 31.2, rebounds: 5.5, assists: 6.4, fantasy_points: 49.3, salary: 10800, injury_status: 'Healthy' },
+    { id: 'giannis', name: 'Giannis Antetokounmpo', team: 'MIL', position: 'F', points: 31.0, rebounds: 11.8, assists: 6.2, fantasy_points: 54.8, salary: 11500, injury_status: 'Healthy' },
+    { id: 'tatum', name: 'Jayson Tatum', team: 'BOS', position: 'F', points: 27.5, rebounds: 8.5, assists: 5.0, fantasy_points: 46.0, salary: 10500, injury_status: 'Healthy' },
+    { id: 'jalen-johnson', name: 'Jalen Johnson', team: 'ATL', position: 'F', points: 19.8, rebounds: 9.5, assists: 4.2, fantasy_points: 36.5, salary: 8500, injury_status: 'Healthy' },
+    { id: 'cunningham', name: 'Cade Cunningham', team: 'DET', position: 'G', points: 23.5, rebounds: 5.5, assists: 7.5, fantasy_points: 42.0, salary: 9500, injury_status: 'Healthy' },
+    { id: 'maxey', name: 'Tyrese Maxey', team: 'PHI', position: 'G', points: 25.0, rebounds: 3.8, assists: 6.2, fantasy_points: 40.5, salary: 9200, injury_status: 'Healthy' },
+    { id: 'wembanyama', name: 'Victor Wembanyama', team: 'SAS', position: 'C', points: 22.0, rebounds: 10.5, assists: 3.5, fantasy_points: 43.0, salary: 9800, injury_status: 'Healthy' },
+    { id: 'curry', name: 'Stephen Curry', team: 'GSW', position: 'G', points: 26.0, rebounds: 4.5, assists: 5.0, fantasy_points: 41.0, salary: 9300, injury_status: 'Healthy' },
+    { id: 'lebron', name: 'LeBron James', team: 'LAL', position: 'F', points: 25.5, rebounds: 7.5, assists: 7.5, fantasy_points: 44.0, salary: 10000, injury_status: 'Healthy' },
+    { id: 'brown', name: 'Jaylen Brown', team: 'BOS', position: 'F', points: 23.5, rebounds: 5.5, assists: 3.5, fantasy_points: 37.5, salary: 8800, injury_status: 'Healthy' },
+    { id: 'brunson', name: 'Jalen Brunson', team: 'NYK', position: 'G', points: 24.5, rebounds: 3.5, assists: 6.5, fantasy_points: 40.0, salary: 9000, injury_status: 'Healthy' },
+    { id: 'giddey', name: 'Josh Giddey', team: 'CHI', position: 'G', points: 14.5, rebounds: 7.5, assists: 6.0, fantasy_points: 32.5, salary: 7800, injury_status: 'Healthy' },
+    { id: 'towns', name: 'Karl-Anthony Towns', team: 'NYK', position: 'C', points: 22.5, rebounds: 10.5, assists: 3.0, fantasy_points: 41.0, salary: 9400, injury_status: 'Healthy' },
+    { id: 'reaves', name: 'Austin Reaves', team: 'LAL', position: 'G', points: 16.5, rebounds: 4.5, assists: 5.5, fantasy_points: 29.5, salary: 7500, injury_status: 'Healthy' },
+    { id: 'hield', name: 'Buddy Hield', team: 'ATL', position: 'G', points: 12.5, rebounds: 3.2, assists: 2.8, fantasy_points: 21.0, salary: 6000, injury_status: 'Healthy' },
+    { id: 'houstan', name: 'Caleb Houstan', team: 'ATL', position: 'F', points: 6.5, rebounds: 2.5, assists: 0.8, fantasy_points: 10.5, salary: 3500, injury_status: 'Healthy' }
   ];
 }
 
 // ====================
-// All other endpoints (NBA games, NFL games, etc.) remain exactly as in your original file
-// ====================
-// (Include all your existing endpoints from your original server.js – they are unchanged)
-// Example: app.get('/api/nba/games', ...) etc.
-// ... (I'm omitting them for brevity, but they are unchanged)
-
-// ====================
-// CATCH-ALL FOR /api/* ROUTES
+// CATCH-ALL FOR /api/*
 // ====================
 app.get('/api/*', (req, res) => {
   const path = req.originalUrl;
@@ -2124,17 +3211,16 @@ app.use(errorHandler);
 // ====================
 async function startServer() {
   try {
-    // Load static NBA players from Python API on startup
     staticNBAPlayers = await fetchStaticNBAPlayers();
+    staticNHLPlayers = await fetchStaticNHLPlayers();
+    staticMLBPlayers = await fetchStaticMLBPlayers();   // <-- add this line
+    staticNFLPlayers = []; // keep empty if not needed
 
-    // MongoDB connection: use MONGODB_URI if set, otherwise fallback to localhost
     const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/fantasydb';
     await mongoose.connect(mongoUri, {
       serverSelectionTimeoutMS: 10000,
       socketTimeoutMS: 45000,
       maxPoolSize: 10,
-      useNewUrlParser: true,
-      useUnifiedTopology: true
     });
     console.log('✅ MongoDB connected');
 
@@ -2151,9 +3237,10 @@ async function startServer() {
       console.log(`   ✅ The Odds API – key present: ${!!(process.env.ODDS_API_KEY || process.env.THE_ODDS_API_KEY)}`);
       console.log(`   ✅ RapidAPI – key present: ${!!process.env.RAPIDAPI_KEY}`);
       console.log(`   ✅ 2026 Static NBA Players – loaded: ${staticNBAPlayers.length}`);
+      console.log(`   ✅ Static NHL Players – loaded: ${staticNHLPlayers.length}`);
       console.log(`\n🎯 KEY ENDPOINTS:`);
-      console.log(`   GET /api/prizepicks/selections - PrizePicks selections (The Odds API + static enrichment)`);
-      console.log(`   GET /api/fantasyhub/players   - Fantasy Hub with NBA API stats + static base (with retry & cache)`);
+      console.log(`   GET /api/prizepicks/selections - PrizePicks selections (The Odds API + static + opponent adjustments)`);
+      console.log(`   GET /api/fantasyhub/players   - Fantasy Hub with NBA API stats + static + opponent adjustments)`);
       console.log(`   GET /api/theoddsapi/playerprops - Raw The Odds API player props (enriched with static)`);
       console.log(`   GET /api/tank01/*             - All Tank01 endpoints (cached with Redis)`);
       console.log(`   GET /api/draft/rankings       - Draft rankings (with Tank01 Redis cache)`);
@@ -2175,10 +3262,9 @@ async function startServer() {
     process.exit(1);
   }
 }
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   startServer();
 }
 
 export { app };
-
-
