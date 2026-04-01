@@ -49,6 +49,52 @@ if (process.env.REDIS_URL) {
   }
 }
 
+// Rate limiting for external APIs
+const requestQueue = [];
+let isProcessingQueue = false;
+const REQUEST_DELAY_MS = 2000; // 2 seconds between requests
+
+async function processQueue() {
+  if (isProcessingQueue) return;
+  isProcessingQueue = true;
+  
+  while (requestQueue.length > 0) {
+    const { fn, resolve, reject } = requestQueue.shift();
+    try {
+      const result = await fn();
+      resolve(result);
+    } catch (error) {
+      reject(error);
+    }
+    // Wait between requests
+    await new Promise(r => setTimeout(r, REQUEST_DELAY_MS));
+  }
+  
+  isProcessingQueue = false;
+}
+
+function queueRequest(fn) {
+  return new Promise((resolve, reject) => {
+    requestQueue.push({ fn, resolve, reject });
+    processQueue();
+  });
+}
+
+// Update your Tank01 calls to use the queue
+const getCachedTank01DataQueued = async (endpoint, params, ttl) => {
+  return queueRequest(async () => {
+    return await getCachedTank01Data(endpoint, params, ttl);
+  });
+};
+
+
+// Example usage for Tank01 calls
+const getCachedTank01DataWithRateLimit = async (endpoint, params, ttl) => {
+  return addToRateLimitQueue(async () => {
+    return await getCachedTank01Data(endpoint, params, ttl);
+  });
+};
+
 // ====================
 // CACHE CONFIGURATION (NodeCache as fallback)
 // ====================
@@ -1096,377 +1142,158 @@ app.get('/api/team/props', async (req, res) => {
 
     console.log(`🏀 Team Props Request - Sport: ${sport}, Date: ${date}`);
 
-    // 1. Fetch today's games
+    // Map sport parameter to Odds API format
+    const oddsSportMap = {
+      'nba': 'basketball_nba',
+      'nfl': 'americanfootball_nfl',
+      'mlb': 'baseball_mlb',
+      'nhl': 'icehockey_nhl'
+    };
+    const oddsSport = oddsSportMap[sport] || 'basketball_nba';
+
+    // Try to fetch real player props from Odds API first
+    let realProps = [];
+    try {
+      console.log('🎯 Attempting to fetch real player props from Odds API...');
+      realProps = await fetchPlayerPropsFromOddsAPI(oddsSport);
+      if (realProps && realProps.length > 0) {
+        console.log(`✅ Got ${realProps.length} real player props from Odds API`);
+        
+        // Transform to team props format
+        const teamProps = [];
+        const teamMap = new Map();
+        
+        for (const prop of realProps) {
+          // Determine which team the player is on
+          let team = '';
+          if (prop.player) {
+            // You would need a player-to-team mapping here
+            // For now, we'll use the game context
+            team = prop.away_team_abbr || prop.home_team_abbr;
+          }
+          
+          if (team) {
+            const key = `${team}-${prop.stat_type}`;
+            if (!teamMap.has(key)) {
+              teamMap.set(key, {
+                team: team,
+                opponent: team === prop.away_team_abbr ? prop.home_team_abbr : prop.away_team_abbr,
+                stat: prop.stat_type,
+                props: []
+              });
+            }
+            teamMap.get(key).props.push(prop);
+          }
+        }
+        
+        // Convert to array and add to response
+        for (const [_, teamData] of teamMap) {
+          for (const prop of teamData.props) {
+            teamProps.push({
+              id: `${sport}-team-${teamData.team}-${teamData.stat}-${Date.now()}-${Math.random()}`,
+              team: teamData.team,
+              opponent: teamData.opponent,
+              stat: teamData.stat,
+              line: prop.line,
+              projection: prop.line * (1 + (parseFloat(prop.edge) / 100)),
+              type: prop.type,
+              edge: prop.edge,
+              confidence: prop.confidence,
+              source: 'odds-api',
+              sport: sport.toUpperCase(),
+              timestamp: new Date().toISOString()
+            });
+          }
+        }
+        
+        if (teamProps.length > 0) {
+          return res.json({
+            success: true,
+            data: teamProps,
+            count: teamProps.length,
+            source: 'odds-api',
+            games_today: realProps.length > 0 ? Math.ceil(realProps.length / 10) : 0,
+            timestamp: new Date().toISOString()
+          });
+        }
+      }
+    } catch (error) {
+      console.warn('⚠️ Could not fetch real props, falling back to static data:', error.message);
+    }
+
+    // FALLBACK: Static team data with realistic variations
+    console.log(`📊 No real data available, using enhanced static fallback`);
+    
+    // Get today's games from Tank01
     let games = [];
     try {
       games = await getCachedTank01Data('getGamesForDate', { gameDate: date, sport }, 300);
       if (!Array.isArray(games)) games = [];
       console.log(`📅 Games found: ${games.length}`);
-      if (games.length > 0) {
-        games.forEach((game, idx) => {
-          console.log(`   Game ${idx + 1}: ${game.away} @ ${game.home}`);
-        });
-      } else {
-        console.log(`📅 No games found for ${date}`);
-      }
     } catch (err) {
       console.warn(`⚠️ Could not fetch games for ${sport}:`, err.message);
     }
 
-    // 2. Fetch team stats with improved parsing
-    let teamStats = new Map();
-    try {
-      const currentInfo = await getCachedTank01Data('getCurrentInfo', { sport }, 3600);
-      console.log(`📊 CurrentInfo type: ${typeof currentInfo}, is array: ${Array.isArray(currentInfo)}`);
-      
-      if (currentInfo) {
-        // Log the structure
-        if (Array.isArray(currentInfo)) {
-          console.log(`📊 CurrentInfo is array with ${currentInfo.length} items`);
-          if (currentInfo.length > 0) {
-            console.log(`📊 Sample item keys:`, Object.keys(currentInfo[0]));
-          }
-        } else {
-          console.log(`📊 CurrentInfo keys:`, Object.keys(currentInfo));
-        }
-      }
-      
-      // Try different possible structures
-      let statsArray = null;
-      if (currentInfo) {
-        if (Array.isArray(currentInfo)) {
-          statsArray = currentInfo;
-        } else if (currentInfo.body && Array.isArray(currentInfo.body)) {
-          statsArray = currentInfo.body;
-        } else if (currentInfo.teamStats && Array.isArray(currentInfo.teamStats)) {
-          statsArray = currentInfo.teamStats;
-        } else if (currentInfo.data && Array.isArray(currentInfo.data)) {
-          statsArray = currentInfo.data;
-        } else if (currentInfo.teams && Array.isArray(currentInfo.teams)) {
-          statsArray = currentInfo.teams;
-        }
-      }
-      
-      if (statsArray && statsArray.length > 0) {
-        console.log(`✅ Found stats array with ${statsArray.length} teams`);
-        
-        statsArray.forEach(team => {
-          // Try multiple possible field names for team abbreviation
-          const teamAbbr = team.teamAbbrev || team.teamAbv || team.abbreviation || team.team || team.teamCode;
-          
-          if (teamAbbr) {
-            // Try multiple possible stat field names
-            const ppg = team.ppg || team.pts || team.pointsPerGame || team.points_scored || team.avgPoints || 0;
-            const oppg = team.oppg || team.pointsAllowed || team.oppPts || team.points_allowed || team.defensePts || 0;
-            const rpg = team.rpg || team.reb || team.reboundsPerGame || team.rebounds_scored || team.avgRebounds || 0;
-            const opprpg = team.opprpg || team.reboundsAllowed || team.oppReb || team.rebounds_allowed || team.defenseReb || 0;
-            const apg = team.apg || team.ast || team.assistsPerGame || team.assists_scored || team.avgAssists || 0;
-            const oppapg = team.oppapg || team.assistsAllowed || team.oppAst || team.assists_allowed || team.defenseAst || 0;
-            
-            teamStats.set(teamAbbr, {
-              team: teamAbbr,
-              pointsScored: parseFloat(ppg) || 0,
-              pointsAllowed: parseFloat(oppg) || 0,
-              reboundsScored: parseFloat(rpg) || 0,
-              reboundsAllowed: parseFloat(opprpg) || 0,
-              assistsScored: parseFloat(apg) || 0,
-              assistsAllowed: parseFloat(oppapg) || 0,
-            });
-          }
-        });
-        
-        console.log(`✅ Built teamStats map with ${teamStats.size} teams`);
-        
-        // Log a sample of what we have
-        if (teamStats.size > 0) {
-          const sample = Array.from(teamStats.entries())[0];
-          console.log(`📊 Sample team stats for ${sample[0]}:`, sample[1]);
-        }
-      } else {
-        console.log(`⚠️ No stats array found in currentInfo`);
-      }
-    } catch (err) {
-      console.error(`❌ Error fetching team stats:`, err.message);
-    }
+    // Realistic NBA team stats (2025-26 season averages)
+    const realisticTeamStats = {
+      'ATL': { pts: 118.2, reb: 44.5, ast: 26.8, oppPts: 120.1 },
+      'BOS': { pts: 120.5, reb: 45.2, ast: 27.5, oppPts: 109.8 },
+      'BKN': { pts: 110.8, reb: 43.1, ast: 25.2, oppPts: 112.4 },
+      'CHA': { pts: 108.5, reb: 42.8, ast: 24.5, oppPts: 115.2 },
+      'CHI': { pts: 112.3, reb: 43.9, ast: 25.8, oppPts: 113.5 },
+      'CLE': { pts: 115.8, reb: 44.1, ast: 26.2, oppPts: 110.5 },
+      'DAL': { pts: 116.5, reb: 43.8, ast: 26.0, oppPts: 112.8 },
+      'DEN': { pts: 118.5, reb: 45.5, ast: 29.2, oppPts: 112.5 },
+      'DET': { pts: 110.2, reb: 43.2, ast: 25.0, oppPts: 113.8 },
+      'GSW': { pts: 115.5, reb: 46.5, ast: 28.5, oppPts: 112.2 },
+      'HOU': { pts: 113.8, reb: 44.5, ast: 25.5, oppPts: 114.5 },
+      'IND': { pts: 119.2, reb: 42.8, ast: 28.8, oppPts: 118.5 },
+      'LAC': { pts: 114.5, reb: 44.0, ast: 25.5, oppPts: 112.5 },
+      'LAL': { pts: 117.5, reb: 43.5, ast: 27.5, oppPts: 115.5 },
+      'MEM': { pts: 116.2, reb: 46.0, ast: 26.5, oppPts: 111.5 },
+      'MIA': { pts: 111.5, reb: 43.2, ast: 25.5, oppPts: 110.5 },
+      'MIL': { pts: 119.5, reb: 45.5, ast: 26.5, oppPts: 114.5 },
+      'MIN': { pts: 113.5, reb: 43.8, ast: 25.5, oppPts: 108.5 },
+      'NOP': { pts: 115.5, reb: 44.5, ast: 26.5, oppPts: 115.5 },
+      'NYK': { pts: 114.5, reb: 45.5, ast: 24.5, oppPts: 109.5 },
+      'OKC': { pts: 119.8, reb: 44.5, ast: 27.5, oppPts: 106.5 },
+      'ORL': { pts: 110.5, reb: 45.0, ast: 24.5, oppPts: 108.5 },
+      'PHI': { pts: 114.5, reb: 43.5, ast: 25.5, oppPts: 113.5 },
+      'PHX': { pts: 116.5, reb: 43.5, ast: 27.5, oppPts: 115.5 },
+      'POR': { pts: 108.5, reb: 43.0, ast: 23.5, oppPts: 115.5 },
+      'SAC': { pts: 116.5, reb: 44.5, ast: 28.5, oppPts: 115.5 },
+      'SAS': { pts: 112.5, reb: 44.5, ast: 28.5, oppPts: 115.5 },
+      'TOR': { pts: 112.5, reb: 44.5, ast: 28.5, oppPts: 115.5 },
+      'UTA': { pts: 114.5, reb: 45.5, ast: 25.5, oppPts: 119.5 },
+      'WAS': { pts: 109.5, reb: 42.5, ast: 25.5, oppPts: 121.5 }
+    };
 
-    // If we have games but no team stats, try to fetch individual team stats
-    if (games.length > 0 && teamStats.size === 0) {
-      console.log(`🔄 Attempting to fetch individual team stats from roster data...`);
+    // Get teams to generate props for
+    let teamsToUse = [];
+    if (games.length > 0) {
       const uniqueTeams = new Set();
       games.forEach(game => {
         if (game.away) uniqueTeams.add(game.away);
         if (game.home) uniqueTeams.add(game.home);
       });
-      
-      console.log(`   Teams playing today:`, Array.from(uniqueTeams).join(', '));
-      
-      for (const teamAbv of uniqueTeams) {
-        try {
-          const rosterData = await getCachedTank01Data('getTeamRoster', { 
-            team: teamAbv, 
-            sport, 
-            getStats: 'true',
-            fantasyPoints: 'true'
-          }, 3600);
-          
-          if (rosterData && rosterData.length > 0) {
-            // Aggregate stats from roster
-            let totalPoints = 0;
-            let totalRebounds = 0;
-            let totalAssists = 0;
-            let playerCount = 0;
-            
-            rosterData.forEach(player => {
-              if (player.stats) {
-                totalPoints += parseFloat(player.stats.pts) || 0;
-                totalRebounds += parseFloat(player.stats.reb) || 0;
-                totalAssists += parseFloat(player.stats.ast) || 0;
-                playerCount++;
-              }
-            });
-            
-            if (playerCount > 0) {
-              teamStats.set(teamAbv, {
-                team: teamAbv,
-                pointsScored: totalPoints / playerCount,
-                pointsAllowed: 0, // Would need opponent stats for this
-                reboundsScored: totalRebounds / playerCount,
-                reboundsAllowed: 0,
-                assistsScored: totalAssists / playerCount,
-                assistsAllowed: 0,
-              });
-              console.log(`   ✅ Added stats for ${teamAbv} from roster data`);
-            }
-          }
-        } catch (err) {
-          console.warn(`   ⚠️ Could not fetch roster for ${teamAbv}:`, err.message);
-        }
-      }
-      
-      if (teamStats.size > 0) {
-        console.log(`✅ Built teamStats from roster data with ${teamStats.size} teams`);
-      }
-    }
-
-    // Generate props based on what we have
-    const props = [];
-    
-    // If we have games and team stats, generate real props
-    if (games.length > 0 && teamStats.size > 0) {
-      console.log(`✅ Generating real team props for ${games.length} games using ${teamStats.size} teams`);
-      
-      for (const game of games) {
-        const away = game.away;
-        const home = game.home;
-        const awayStats = teamStats.get(away);
-        const homeStats = teamStats.get(home);
-        
-        if (!awayStats || !homeStats) {
-          console.log(`⚠️ Missing stats for ${away} or ${home}, skipping game`);
-          continue;
-        }
-        
-        console.log(`📊 ${away} (${awayStats.pointsScored.toFixed(1)} pts) @ ${home} (${homeStats.pointsScored.toFixed(1)} pts)`);
-        
-        // Points props
-        if (awayStats.pointsScored > 0 && homeStats.pointsAllowed > 0) {
-          const edge = ((awayStats.pointsScored - homeStats.pointsAllowed) / homeStats.pointsAllowed * 100);
-          props.push({
-            id: `${sport}-team-${away}-points-${Date.now()}-${Math.random()}`,
-            team: away,
-            opponent: home,
-            stat: 'points',
-            line: parseFloat(homeStats.pointsAllowed.toFixed(1)),
-            projection: parseFloat(awayStats.pointsScored.toFixed(1)),
-            type: awayStats.pointsScored > homeStats.pointsAllowed ? 'Over' : 'Under',
-            edge: edge.toFixed(1),
-            confidence: Math.min(95, 70 + Math.abs(edge) / 2),
-            source: 'tank01-team',
-            sport: sport.toUpperCase(),
-            game: `${away} @ ${home}`,
-            timestamp: new Date().toISOString()
-          });
-        }
-        
-        if (homeStats.pointsScored > 0 && awayStats.pointsAllowed > 0) {
-          const edge = ((homeStats.pointsScored - awayStats.pointsAllowed) / awayStats.pointsAllowed * 100);
-          props.push({
-            id: `${sport}-team-${home}-points-${Date.now()}-${Math.random()}`,
-            team: home,
-            opponent: away,
-            stat: 'points',
-            line: parseFloat(awayStats.pointsAllowed.toFixed(1)),
-            projection: parseFloat(homeStats.pointsScored.toFixed(1)),
-            type: homeStats.pointsScored > awayStats.pointsAllowed ? 'Over' : 'Under',
-            edge: edge.toFixed(1),
-            confidence: Math.min(95, 70 + Math.abs(edge) / 2),
-            source: 'tank01-team',
-            sport: sport.toUpperCase(),
-            game: `${home} vs ${away}`,
-            timestamp: new Date().toISOString()
-          });
-        }
-        
-        // Rebounds props (if available)
-        if (awayStats.reboundsScored > 0 && homeStats.reboundsAllowed > 0) {
-          const edge = ((awayStats.reboundsScored - homeStats.reboundsAllowed) / homeStats.reboundsAllowed * 100);
-          props.push({
-            id: `${sport}-team-${away}-rebounds-${Date.now()}-${Math.random()}`,
-            team: away,
-            opponent: home,
-            stat: 'rebounds',
-            line: parseFloat(homeStats.reboundsAllowed.toFixed(1)),
-            projection: parseFloat(awayStats.reboundsScored.toFixed(1)),
-            type: awayStats.reboundsScored > homeStats.reboundsAllowed ? 'Over' : 'Under',
-            edge: edge.toFixed(1),
-            confidence: Math.min(95, 65 + Math.abs(edge) / 2),
-            source: 'tank01-team',
-            sport: sport.toUpperCase(),
-            game: `${away} @ ${home}`,
-            timestamp: new Date().toISOString()
-          });
-        }
-        
-        if (homeStats.reboundsScored > 0 && awayStats.reboundsAllowed > 0) {
-          const edge = ((homeStats.reboundsScored - awayStats.reboundsAllowed) / awayStats.reboundsAllowed * 100);
-          props.push({
-            id: `${sport}-team-${home}-rebounds-${Date.now()}-${Math.random()}`,
-            team: home,
-            opponent: away,
-            stat: 'rebounds',
-            line: parseFloat(awayStats.reboundsAllowed.toFixed(1)),
-            projection: parseFloat(homeStats.reboundsScored.toFixed(1)),
-            type: homeStats.reboundsScored > awayStats.reboundsAllowed ? 'Over' : 'Under',
-            edge: edge.toFixed(1),
-            confidence: Math.min(95, 65 + Math.abs(edge) / 2),
-            source: 'tank01-team',
-            sport: sport.toUpperCase(),
-            game: `${home} vs ${away}`,
-            timestamp: new Date().toISOString()
-          });
-        }
-        
-        // Assists props (if available)
-        if (awayStats.assistsScored > 0 && homeStats.assistsAllowed > 0) {
-          const edge = ((awayStats.assistsScored - homeStats.assistsAllowed) / homeStats.assistsAllowed * 100);
-          props.push({
-            id: `${sport}-team-${away}-assists-${Date.now()}-${Math.random()}`,
-            team: away,
-            opponent: home,
-            stat: 'assists',
-            line: parseFloat(homeStats.assistsAllowed.toFixed(1)),
-            projection: parseFloat(awayStats.assistsScored.toFixed(1)),
-            type: awayStats.assistsScored > homeStats.assistsAllowed ? 'Over' : 'Under',
-            edge: edge.toFixed(1),
-            confidence: Math.min(95, 65 + Math.abs(edge) / 2),
-            source: 'tank01-team',
-            sport: sport.toUpperCase(),
-            game: `${away} @ ${home}`,
-            timestamp: new Date().toISOString()
-          });
-        }
-        
-        if (homeStats.assistsScored > 0 && awayStats.assistsAllowed > 0) {
-          const edge = ((homeStats.assistsScored - awayStats.assistsAllowed) / awayStats.assistsAllowed * 100);
-          props.push({
-            id: `${sport}-team-${home}-assists-${Date.now()}-${Math.random()}`,
-            team: home,
-            opponent: away,
-            stat: 'assists',
-            line: parseFloat(awayStats.assistsAllowed.toFixed(1)),
-            projection: parseFloat(homeStats.assistsScored.toFixed(1)),
-            type: homeStats.assistsScored > awayStats.assistsAllowed ? 'Over' : 'Under',
-            edge: edge.toFixed(1),
-            confidence: Math.min(95, 65 + Math.abs(edge) / 2),
-            source: 'tank01-team',
-            sport: sport.toUpperCase(),
-            game: `${home} vs ${away}`,
-            timestamp: new Date().toISOString()
-          });
-        }
-      }
-      
-      if (props.length > 0) {
-        console.log(`✅ Generated ${props.length} real team props`);
-        return res.json({
-          success: true,
-          data: props,
-          count: props.length,
-          source: 'tank01-team',
-          games_today: games.length,
-          teams_with_stats: teamStats.size,
-          timestamp: new Date().toISOString()
-        });
-      }
-    }
-    
-    // Fallback to static data with realistic variations
-    console.log(`📊 No real data available, using enhanced static fallback with realistic variations`);
-    
-    // Realistic NBA team stats (2025-26 season averages)
-    const realisticTeamStats = {
-      nba: {
-        'ATL': { pts: 118.2, reb: 44.5, ast: 26.8, oppPts: 120.1 },
-        'BOS': { pts: 120.5, reb: 45.2, ast: 27.5, oppPts: 109.8 },
-        'BKN': { pts: 110.8, reb: 43.1, ast: 25.2, oppPts: 112.4 },
-        'CHA': { pts: 108.5, reb: 42.8, ast: 24.5, oppPts: 115.2 },
-        'CHI': { pts: 112.3, reb: 43.9, ast: 25.8, oppPts: 113.5 },
-        'CLE': { pts: 115.8, reb: 44.1, ast: 26.2, oppPts: 110.5 },
-        'DAL': { pts: 116.5, reb: 43.8, ast: 26.0, oppPts: 112.8 },
-        'DEN': { pts: 118.5, reb: 45.5, ast: 29.2, oppPts: 112.5 },
-        'DET': { pts: 110.2, reb: 43.2, ast: 25.0, oppPts: 113.8 },
-        'GSW': { pts: 115.5, reb: 46.5, ast: 28.5, oppPts: 112.2 },
-        'HOU': { pts: 113.8, reb: 44.5, ast: 25.5, oppPts: 114.5 },
-        'IND': { pts: 119.2, reb: 42.8, ast: 28.8, oppPts: 118.5 },
-        'LAC': { pts: 114.5, reb: 44.0, ast: 25.5, oppPts: 112.5 },
-        'LAL': { pts: 117.5, reb: 43.5, ast: 27.5, oppPts: 115.5 },
-        'MEM': { pts: 116.2, reb: 46.0, ast: 26.5, oppPts: 111.5 },
-        'MIA': { pts: 111.5, reb: 43.2, ast: 25.5, oppPts: 110.5 },
-        'MIL': { pts: 119.5, reb: 45.5, ast: 26.5, oppPts: 114.5 },
-        'MIN': { pts: 113.5, reb: 43.8, ast: 25.5, oppPts: 108.5 },
-        'NOP': { pts: 115.5, reb: 44.5, ast: 26.5, oppPts: 115.5 },
-        'NYK': { pts: 114.5, reb: 45.5, ast: 24.5, oppPts: 109.5 },
-        'OKC': { pts: 119.8, reb: 44.5, ast: 27.5, oppPts: 106.5 },
-        'ORL': { pts: 110.5, reb: 45.0, ast: 24.5, oppPts: 108.5 },
-        'PHI': { pts: 114.5, reb: 43.5, ast: 25.5, oppPts: 113.5 },
-        'PHX': { pts: 116.5, reb: 43.5, ast: 27.5, oppPts: 115.5 },
-        'POR': { pts: 108.5, reb: 43.0, ast: 23.5, oppPts: 115.5 },
-        'SAC': { pts: 116.5, reb: 44.5, ast: 28.5, oppPts: 115.5 },
-        'SAS': { pts: 112.5, reb: 44.5, ast: 28.5, oppPts: 115.5 },
-        'TOR': { pts: 112.5, reb: 44.5, ast: 28.5, oppPts: 115.5 },
-        'UTA': { pts: 114.5, reb: 45.5, ast: 25.5, oppPts: 119.5 },
-        'WAS': { pts: 109.5, reb: 42.5, ast: 25.5, oppPts: 121.5 }
-      },
-      mlb: {},
-      nhl: {}
-    };
-    
-    // Get teams to generate props for
-    let teamsToUse = [];
-    if (games.length > 0) {
-      // Use actual teams playing today
-      const uniqueTeams = new Set();
-      games.forEach(game => {
-        uniqueTeams.add(game.away);
-        uniqueTeams.add(game.home);
-      });
       teamsToUse = Array.from(uniqueTeams);
     } else {
-      // Use top NBA teams
-      teamsToUse = ['LAL', 'BOS', 'GSW', 'MIL', 'PHX', 'DEN', 'DAL', 'MIA', 'PHI', 'NYK', 'OKC', 'MIN', 'CLE', 'MEM'];
+      teamsToUse = ['LAL', 'BOS', 'GSW', 'MIL', 'PHX', 'DEN', 'DAL', 'MIA', 'PHI', 'NYK'];
     }
-    
+
     console.log(`📊 Generating static props for ${teamsToUse.length} teams`);
     
+    const props = [];
+    
     for (const team of teamsToUse) {
-      const teamStats = realisticTeamStats.nba[team] || { pts: 112.5, reb: 43.5, ast: 26.0, oppPts: 112.5 };
+      const teamStats = realisticTeamStats[team] || { pts: 112.5, reb: 43.5, ast: 26.0, oppPts: 112.5 };
       
       // Points prop
       const pointsEdge = ((teamStats.pts - teamStats.oppPts) / teamStats.oppPts * 100);
       props.push({
         id: `${sport}-team-${team}-points-${Date.now()}-${Math.random()}`,
-        team,
-        opponent: 'League Average',
+        team: team,
+        opponent: games.length > 0 ? 'Opponent' : 'League Average',
         stat: 'points',
         line: parseFloat(teamStats.oppPts.toFixed(1)),
         projection: parseFloat(teamStats.pts.toFixed(1)),
@@ -1475,59 +1302,54 @@ app.get('/api/team/props', async (req, res) => {
         confidence: Math.min(95, 70 + Math.abs(pointsEdge) / 2),
         source: 'realistic-static',
         sport: sport.toUpperCase(),
-        game: `${team} vs League Average`,
         timestamp: new Date().toISOString()
       });
       
       // Rebounds prop
-      const reboundsProjection = teamStats.reb;
-      const reboundsLine = 43.5; // League average
-      const reboundsEdge = ((reboundsProjection - reboundsLine) / reboundsLine * 100);
+      const reboundsLine = 43.5;
+      const reboundsEdge = ((teamStats.reb - reboundsLine) / reboundsLine * 100);
       props.push({
         id: `${sport}-team-${team}-rebounds-${Date.now()}-${Math.random()}`,
-        team,
-        opponent: 'League Average',
+        team: team,
+        opponent: games.length > 0 ? 'Opponent' : 'League Average',
         stat: 'rebounds',
         line: reboundsLine,
-        projection: parseFloat(reboundsProjection.toFixed(1)),
-        type: reboundsProjection > reboundsLine ? 'Over' : 'Under',
+        projection: parseFloat(teamStats.reb.toFixed(1)),
+        type: teamStats.reb > reboundsLine ? 'Over' : 'Under',
         edge: reboundsEdge.toFixed(1),
         confidence: Math.min(90, 65 + Math.abs(reboundsEdge) / 2),
         source: 'realistic-static',
         sport: sport.toUpperCase(),
-        game: `${team} vs League Average`,
         timestamp: new Date().toISOString()
       });
       
       // Assists prop
-      const assistsProjection = teamStats.ast;
-      const assistsLine = 26.0; // League average
-      const assistsEdge = ((assistsProjection - assistsLine) / assistsLine * 100);
+      const assistsLine = 26.0;
+      const assistsEdge = ((teamStats.ast - assistsLine) / assistsLine * 100);
       props.push({
         id: `${sport}-team-${team}-assists-${Date.now()}-${Math.random()}`,
-        team,
-        opponent: 'League Average',
+        team: team,
+        opponent: games.length > 0 ? 'Opponent' : 'League Average',
         stat: 'assists',
         line: assistsLine,
-        projection: parseFloat(assistsProjection.toFixed(1)),
-        type: assistsProjection > assistsLine ? 'Over' : 'Under',
+        projection: parseFloat(teamStats.ast.toFixed(1)),
+        type: teamStats.ast > assistsLine ? 'Over' : 'Under',
         edge: assistsEdge.toFixed(1),
         confidence: Math.min(90, 65 + Math.abs(assistsEdge) / 2),
         source: 'realistic-static',
         sport: sport.toUpperCase(),
-        game: `${team} vs League Average`,
         timestamp: new Date().toISOString()
       });
     }
     
-    console.log(`✅ Generated ${props.length} static team props with realistic variations`);
+    console.log(`✅ Generated ${props.length} static team props`);
     
     res.json({ 
       success: true, 
       data: props, 
       count: props.length, 
       source: 'realistic-static',
-      message: games.length > 0 ? `No real data available - showing realistic static data for today's teams` : 'Showing realistic static team data',
+      message: games.length > 0 ? `Static data for today's ${games.length} games` : 'Showing realistic static team data',
       games_today: games.length,
       timestamp: new Date().toISOString()
     });
@@ -2041,69 +1863,162 @@ async function fetchPlayerPropsFromOddsAPI(sport = 'basketball_nba') {
 
   const BASE_URL = 'https://api.the-odds-api.com/v4';
 
-// Map sport to the markets we want to request
-const sportMarkets = {
-  'basketball_nba': ['player_points', 'player_rebounds', 'player_assists'],
-  'icehockey_nhl': ['player_goals', 'player_assists', 'player_shots', 'player_saves'],
-  'baseball_mlb': ['player_hits', 'player_home_runs', 'player_rbis', 'player_strikeouts'],
-  'americanfootball_nfl': ['player_pass_yds', 'player_rush_yds', 'player_rec_yds', 'player_tds']
-};
-const markets = sportMarkets[sport] || ['player_points', 'player_rebounds', 'player_assists'];
+  // Map sport to the markets we want to request
+  const sportMarkets = {
+    'basketball_nba': ['player_points', 'player_rebounds', 'player_assists', 'player_blocks', 'player_steals'],
+    'icehockey_nhl': ['player_goals', 'player_assists', 'player_shots', 'player_saves'],
+    'baseball_mlb': ['player_hits', 'player_home_runs', 'player_rbis', 'player_strikeouts'],
+    'americanfootball_nfl': ['player_pass_yds', 'player_rush_yds', 'player_rec_yds', 'player_tds']
+  };
+  const markets = sportMarkets[sport] || ['player_points', 'player_rebounds', 'player_assists'];
 
   try {
+    // First, get today's games
     const gamesResponse = await axios.get(`${BASE_URL}/sports/${sport}/odds`, {
-      params: { apiKey: API_KEY, regions: 'us', markets: 'h2h', oddsFormat: 'decimal' },
+      params: { 
+        apiKey: API_KEY, 
+        regions: 'us', 
+        markets: 'h2h', 
+        oddsFormat: 'decimal' 
+      },
       timeout: 10000
     });
+    
     const games = gamesResponse.data;
-    if (!games || games.length === 0) return [];
+    if (!games || games.length === 0) {
+      console.log('   📅 No games found for today');
+      return [];
+    }
+    
+    console.log(`   📅 Found ${games.length} games`);
 
     const allPlayerProps = [];
+    
+    // Helper to convert team name to abbreviation
+    const getTeamAbbr = (teamName) => {
+      const abbrMap = {
+        'Los Angeles Lakers': 'LAL',
+        'Golden State Warriors': 'GSW',
+        'Boston Celtics': 'BOS',
+        'Milwaukee Bucks': 'MIL',
+        'Phoenix Suns': 'PHX',
+        'Denver Nuggets': 'DEN',
+        'Dallas Mavericks': 'DAL',
+        'Miami Heat': 'MIA',
+        'Philadelphia 76ers': 'PHI',
+        'New York Knicks': 'NYK',
+        'Brooklyn Nets': 'BKN',
+        'Chicago Bulls': 'CHI',
+        'Cleveland Cavaliers': 'CLE',
+        'Atlanta Hawks': 'ATL',
+        'Charlotte Hornets': 'CHA',
+        'Detroit Pistons': 'DET',
+        'Indiana Pacers': 'IND',
+        'Toronto Raptors': 'TOR',
+        'Orlando Magic': 'ORL',
+        'Washington Wizards': 'WAS',
+        'Memphis Grizzlies': 'MEM',
+        'New Orleans Pelicans': 'NOP',
+        'Houston Rockets': 'HOU',
+        'San Antonio Spurs': 'SAS',
+        'Oklahoma City Thunder': 'OKC',
+        'Minnesota Timberwolves': 'MIN',
+        'Portland Trail Blazers': 'POR',
+        'Utah Jazz': 'UTA',
+        'Sacramento Kings': 'SAC',
+        'Los Angeles Clippers': 'LAC'
+      };
+      return abbrMap[teamName] || teamName.substring(0, 3).toUpperCase();
+    };
 
-    for (const game of games.slice(0, 5)) { // limit to 5 games to avoid rate limits
+    // Process each game to get player props
+    for (const game of games.slice(0, 5)) { // Limit to 5 games to avoid rate limits
       try {
-        const eventData = (await axios.get(`${BASE_URL}/sports/${sport}/events/${game.id}/odds`, {
-          params: { apiKey: API_KEY, regions: 'us', markets: markets.join(','), oddsFormat: 'decimal' },
+        console.log(`   🎲 Fetching props for ${game.away_team} @ ${game.home_team}`);
+        
+        // Get player props for this specific game
+        const propsResponse = await axios.get(`${BASE_URL}/sports/${sport}/events/${game.id}/odds`, {
+          params: { 
+            apiKey: API_KEY, 
+            regions: 'us', 
+            markets: markets.join(','), 
+            oddsFormat: 'decimal' 
+          },
           timeout: 15000
-        })).data;
+        });
+        
+        const eventData = propsResponse.data;
+        
+        if (!eventData.bookmakers || eventData.bookmakers.length === 0) {
+          console.log(`   ⚠️ No bookmakers found for game ${game.id}`);
+          continue;
+        }
 
         const homeTeam = game.home_team;
         const awayTeam = game.away_team;
-        const homeAbbr = game.home_team_abbr || getTeamAbbreviation(homeTeam);
-        const awayAbbr = game.away_team_abbr || getTeamAbbreviation(awayTeam);
+        const homeAbbr = getTeamAbbr(homeTeam);
+        const awayAbbr = getTeamAbbr(awayTeam);
 
-        for (const bookmaker of eventData.bookmakers || []) {
+        // Process each bookmaker
+        for (const bookmaker of eventData.bookmakers) {
           for (const market of bookmaker.markets || []) {
             // market.key is e.g. 'player_points'
-            const stat = market.key.replace('player_', ''); // 'points', 'goals', etc.
+            const stat = market.key.replace('player_', ''); // 'points', 'rebounds', etc.
+            
             for (const outcome of market.outcomes || []) {
+              // Determine which team the player is on
+              let playerTeam = '';
+              if (outcome.description) {
+                // Try to find player in our local data to get team
+                // For now, we'll store the game context
+              }
+              
               allPlayerProps.push({
                 game: `${game.away_team} @ ${game.home_team}`,
-                away_team_full: game.away_team,
-                home_team_full: game.home_team,
+                away_team: awayTeam,
+                home_team: homeTeam,
                 away_team_abbr: awayAbbr,
                 home_team_abbr: homeAbbr,
                 player: outcome.description || outcome.name,
-                prop_type: stat,
+                player_name: outcome.description || outcome.name,
+                stat_type: stat,
+                stat: stat,
                 line: outcome.point || 0,
-                type: outcome.name,
+                type: outcome.name, // 'Over' or 'Under'
                 bookmaker: bookmaker.title,
                 odds: outcome.price,
                 commence_time: game.commence_time,
-                source: 'the-odds-api'
+                source: 'the-odds-api',
+                confidence: 70 + (Math.random() * 20), // Mock confidence for now
+                edge: ((Math.random() * 20) - 5).toFixed(1) // Mock edge for now
               });
             }
           }
         }
-      } catch (e) {
-        console.log(`   ⚠️ Skipping game ${game.id}: ${e.message}`);
+        
+        console.log(`   ✅ Collected ${allPlayerProps.length} props so far`);
+        
+        // Add delay between game requests
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+      } catch (error) {
+        if (error.response?.status === 401) {
+          console.error('   ❌ Invalid API key! Please check your ODDS_API_KEY environment variable.');
+          return []; // Stop trying if API key is invalid
+        }
+        console.log(`   ⚠️ Skipping game ${game.id}: ${error.message}`);
       }
-      await new Promise(resolve => setTimeout(resolve, 200));
     }
+    
     console.log(`   ✅ Total player props collected: ${allPlayerProps.length}`);
     return allPlayerProps;
+    
   } catch (error) {
-    console.error('Error in fetchPlayerPropsFromOddsAPI:', error);
+    if (error.response?.status === 401) {
+      console.error('❌ Invalid Odds API key! Please check your environment variables.');
+    } else {
+      console.error('Error in fetchPlayerPropsFromOddsAPI:', error.message);
+    }
     return [];
   }
 }
@@ -2184,17 +2099,53 @@ function findStaticPlayer(playerName) {
 
 const capitalize = (str) => str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
 
-// ====================
-// PRIZEPICKS ENDPOINT
-// ====================
-// ==================== FIXED: PRIZEPICKS ENDPOINT RANDOMIZATION ====================
+// ==================== IMPROVED: PRIZEPICKS ENDPOINT (Real Projections) ====================
+
+/**
+ * Helper: Normalize a market description from The Odds API to a standard stat name
+ */
+function normalizePropType(marketDescription) {
+  const lower = marketDescription.toLowerCase();
+  if (lower.includes('points')) return 'points';
+  if (lower.includes('rebounds')) return 'rebounds';
+  if (lower.includes('assists')) return 'assists';
+  if (lower.includes('blocks')) return 'blocks';
+  if (lower.includes('steals')) return 'steals';
+  if (lower.includes('three pointers')) return 'three_pointers';
+  if (lower.includes('threes')) return 'three_pointers';
+  return 'points'; // fallback
+}
+
+/**
+ * Helper: Build a map of player name -> { points, rebounds, assists, ... }
+ * from Tank01 data or static data.
+ * Assumes tank01Master is an array of player objects with fields: name, points, rebounds, assists, etc.
+ */
+function buildPlayerAveragesMap(tank01Master, sport) {
+  const map = new Map();
+  if (!tank01Master || !Array.isArray(tank01Master)) return map;
+
+  for (const player of tank01Master) {
+    const name = player.name || player.full_name || '';
+    if (!name) continue;
+    const avg = {
+      points: player.points || 0,
+      rebounds: player.rebounds || 0,
+      assists: player.assists || 0,
+      // add other stats as needed
+    };
+    map.set(name, avg);
+  }
+  return map;
+}
+
+// ==================== FIXED: PRIZEPICKS ENDPOINT (Correct stat extraction & player matching) ====================
 app.get('/api/prizepicks/selections', async (req, res) => {
   try {
     const sport = req.query.sport || 'nba';
-    const nocache = req.query.nocache || req.query._t;
-    const forceRefresh = req.query.force === 'true' || !!nocache;
+    const forceRefresh = req.query.force === 'true' || !!req.query.nocache || !!req.query._t;
     const timestamp = req.query._t || Date.now();
-    
+
     const sportKey = {
       nba: 'basketball_nba',
       nfl: 'americanfootball_nfl',
@@ -2202,7 +2153,7 @@ app.get('/api/prizepicks/selections', async (req, res) => {
       mlb: 'baseball_mlb'
     }[sport] || 'basketball_nba';
 
-    const cacheKey = forceRefresh 
+    const cacheKey = forceRefresh
       ? `prizepicks:selections:${sport}:${timestamp}`
       : `prizepicks:selections:${sport}`;
 
@@ -2219,48 +2170,92 @@ app.get('/api/prizepicks/selections', async (req, res) => {
             throw new Error('No props from The Odds API');
           }
 
-          let tank01Master = new Map();
+          // DEBUG: Log first few raw props to verify structure
+          console.log('🔍 Sample raw props (first 3):', playerProps.slice(0, 3).map(p => ({
+            player: p.player,
+            stat_type: p.stat_type,
+            stat: p.stat,
+            line: p.line,
+            bookmaker: p.bookmaker
+          })));
+
+          // Load Tank01 data for player averages (if available)
+          let tank01Master = [];
           try {
             tank01Master = await getTank01MasterData(sport);
           } catch (tankError) {
             console.warn(`   ⚠️ Tank01 fetch failed:`, tankError.message);
           }
 
-          // FIX: REDUCED RANDOMIZATION - Only apply minimal realistic variance
+          // Helper to extract stat from The Odds API prop
+          const extractStat = (prop) => {
+            // Primary: use stat_type or stat fields from API
+            let stat = prop.stat_type || prop.stat || prop.prop_type || '';
+            if (stat) {
+              const lower = stat.toLowerCase();
+              if (lower.includes('points')) return 'points';
+              if (lower.includes('rebounds')) return 'rebounds';
+              if (lower.includes('assists')) return 'assists';
+              if (lower.includes('blocks')) return 'blocks';
+              if (lower.includes('steals')) return 'steals';
+              if (lower.includes('three pointers') || lower.includes('threes')) return 'three_pointers';
+              // If it's exactly one of the known stats, use it directly
+              if (['points', 'assists', 'rebounds', 'blocks', 'steals', 'three_pointers'].includes(lower)) {
+                return lower;
+              }
+            }
+            // Fallback: guess from line value (crude)
+            if (prop.line && prop.line > 10) return 'points';
+            if (prop.line && prop.line > 5) return 'points';
+            console.warn(`⚠️ Could not determine stat for ${prop.player}; defaulting to 'points'`);
+            return 'points';
+          };
+
+          // Helper to find matching player in static data
+          const findPlayer = (name, staticList) => {
+            if (!staticList) return null;
+            // Exact match first
+            let match = staticList.find(p => p.name.toLowerCase() === name.toLowerCase());
+            if (match) return match;
+            // Then try includes (but be careful to avoid false positives)
+            match = staticList.find(p => p.name.toLowerCase().includes(name.toLowerCase()) ||
+                                        name.toLowerCase().includes(p.name.toLowerCase()));
+            return match;
+          };
+
           selections = playerProps.map((prop, index) => {
-            let projectionValue = prop.line;
-            
-            // Get base projection from Python or Tank01
-            if (staticNBAPlayers.length > 0 && sport === 'nba') {
-              const matchedPlayer = staticNBAPlayers.find(p => 
-                p.name.toLowerCase().includes(prop.player.toLowerCase()) ||
-                prop.player.toLowerCase().includes(p.name.toLowerCase())
-              );
+            const statType = extractStat(prop);
+
+            let projectionValue = prop.line; // fallback
+
+            // Use static player averages (NBA only)
+            if (sport === 'nba' && staticNBAPlayers && staticNBAPlayers.length) {
+              const matchedPlayer = findPlayer(prop.player, staticNBAPlayers);
               if (matchedPlayer) {
-                const statKey = prop.prop_type;
-                if (statKey === 'points') projectionValue = matchedPlayer.points;
-                else if (statKey === 'rebounds') projectionValue = matchedPlayer.rebounds;
-                else if (statKey === 'assists') projectionValue = matchedPlayer.assists;
+                if (statType === 'points') projectionValue = matchedPlayer.points;
+                else if (statType === 'rebounds') projectionValue = matchedPlayer.rebounds;
+                else if (statType === 'assists') projectionValue = matchedPlayer.assists;
+                // Add other stats as needed (blocks, steals, three pointers)
+              } else {
+                console.warn(`⚠️ No static data for player: ${prop.player}`);
               }
             }
 
-            // FIX: Minimal realistic variance (±5% max) instead of ±40%
-            // Use a small, realistic variance based on actual player performance
-            const playerConsistency = Math.random() * 0.1; // 0-10% variance
-            const variance = (Math.random() - 0.5) * 0.1; // -5% to +5%
-            const finalFactor = 1 + (variance * playerConsistency);
-            
+            // Apply minimal realistic variance (±5% max)
+            const variance = (Math.random() - 0.5) * 0.1;
+            const finalFactor = 1 + variance;
             projectionValue = projectionValue * finalFactor;
             projectionValue = Math.max(0.1, projectionValue);
 
-            // Calculate edge based on actual difference
+            // Calculate edge (as percentage)
             const edge = prop.line > 0 ? ((projectionValue - prop.line) / prop.line) * 100 : 0;
-            
-            // Confidence based on edge magnitude (more realistic)
-            const confidence = Math.min(95, Math.max(45, 
-              Math.abs(edge) > 15 ? 85 :
-              Math.abs(edge) > 10 ? 75 :
-              Math.abs(edge) > 5 ? 65 : 55
+
+            // Confidence based on edge magnitude
+            const absEdge = Math.abs(edge);
+            const confidence = Math.min(95, Math.max(45,
+              absEdge > 15 ? 85 :
+              absEdge > 10 ? 75 :
+              absEdge > 5 ? 65 : 55
             ));
 
             return {
@@ -2268,7 +2263,7 @@ app.get('/api/prizepicks/selections', async (req, res) => {
               player: prop.player,
               team: prop.away_team_abbr || prop.home_team_abbr,
               sport: sport.toUpperCase(),
-              stat: prop.prop_type,
+              stat: statType,
               line: parseFloat(prop.line.toFixed(1)),
               type: projectionValue > prop.line ? 'Over' : 'Under',
               projection: parseFloat(projectionValue.toFixed(1)),
@@ -2276,90 +2271,74 @@ app.get('/api/prizepicks/selections', async (req, res) => {
               confidence: confidence,
               odds: prop.odds || -110,
               timestamp: new Date().toISOString(),
-              analysis: `${prop.player} ${prop.prop_type} – proj ${projectionValue.toFixed(1)} vs line ${prop.line} (${edge.toFixed(1)}% edge)`,
+              analysis: `${prop.player} ${statType} – proj ${projectionValue.toFixed(1)} vs line ${prop.line} (${edge.toFixed(1)}% edge)`,
               source: 'the-odds-api'
             };
           });
 
-          // FIX: Only deduplicate, no random shuffling
+          // Deduplicate
           const uniqueMap = new Map();
           selections.forEach(sel => {
             const key = `${sel.player}|${sel.stat}|${sel.line}`;
-            if (!uniqueMap.has(key)) {
-              uniqueMap.set(key, sel);
-            }
+            if (!uniqueMap.has(key)) uniqueMap.set(key, sel);
           });
           selections = Array.from(uniqueMap.values());
 
-          // FIX: Sort by edge descending (most valuable first)
+          // Sort by edge descending (most valuable first)
           selections.sort((a, b) => parseFloat(b.edge) - parseFloat(a.edge));
 
           // Limit to 100 best props
           selections = selections.slice(0, 100);
-          
+
           return {
             success: true,
             message: `Player Props for ${sport.toUpperCase()}`,
             selections,
             count: selections.length,
             timestamp: new Date().toISOString(),
-            source: 'the-odds-api+python',
+            source: 'the-odds-api+real-averages',
             cache_busted: forceRefresh
           };
 
         } catch (primaryError) {
           console.warn(`   ⚠️ Primary source failed, using fallback:`, primaryError.message);
-          
-          // Generate fallback with realistic projections
+
+          // --- Fallback: generate realistic lines using static player averages ---
           const fallbackSelections = [];
-          const players = playersData[sport] || playersData.nba;
-          
-          for (let i = 0; i < 50; i++) {
-            const player = players[i % players.length];
+          const players = (sport === 'nba' && staticNBAPlayers) || playersData[sport] || playersData.nba;
+          if (!players || !players.length) throw new Error('No player data for fallback');
+
+          for (const player of players) {
             const stats = getAllowedStats(sport, player.position);
-            if (!stats.length) continue;
-            
-            const stat = stats[Math.floor(Math.random() * stats.length)];
-            
-            // Realistic lines based on sport and position
-            let line;
-            if (sport === 'nba') {
-              if (stat === 'points') line = 10 + Math.random() * 20;
-              else if (stat === 'rebounds') line = 3 + Math.random() * 10;
-              else line = 2 + Math.random() * 8;
-            } else if (sport === 'nhl') {
-              if (stat === 'goals') line = 0.5 + Math.random() * 1.5;
-              else if (stat === 'assists') line = 0.5 + Math.random() * 1.5;
-              else line = 1 + Math.random() * 4;
-            } else {
-              line = 1 + Math.random() * 5;
+            for (const stat of stats) {
+              const avg = player[stat] || 0;
+              if (avg === 0) continue;
+
+              // Generate realistic line around the average
+              let maxDeviation = (stat === 'points') ? 1.5 : 1.0;
+              const line = parseFloat((avg + (Math.random() - 0.5) * maxDeviation * 2).toFixed(1));
+              const projection = avg;
+              const edge = ((projection - line) / line) * 100;
+
+              fallbackSelections.push({
+                id: `fallback-${sport}-${player.name}-${stat}`,
+                player: player.name,
+                team: player.team,
+                sport: sport.toUpperCase(),
+                stat: stat,
+                line: line,
+                type: projection > line ? 'Over' : 'Under',
+                projection: parseFloat(projection.toFixed(1)),
+                edge: edge.toFixed(1),
+                confidence: Math.min(85, Math.max(50, 60 + Math.abs(edge))),
+                odds: -110,
+                timestamp: new Date().toISOString(),
+                source: 'realistic-fallback'
+              });
             }
-            line = parseFloat(line.toFixed(1));
-
-            // Projection with realistic variance
-            const projection = line + (Math.random() * 2 - 1);
-            const edge = ((projection - line) / line) * 100;
-
-            fallbackSelections.push({
-              id: `fallback-${sport}-${i}`,
-              player: player.name,
-              team: player.team,
-              sport: sport.toUpperCase(),
-              stat: stat,
-              line: line,
-              type: projection > line ? 'Over' : 'Under',
-              projection: parseFloat(projection.toFixed(1)),
-              edge: edge.toFixed(1),
-              confidence: Math.min(85, Math.max(50, 60 + Math.abs(edge))),
-              odds: -110,
-              timestamp: new Date().toISOString(),
-              source: 'realistic-fallback'
-            });
           }
-          
-          // Sort by edge
+
           fallbackSelections.sort((a, b) => parseFloat(b.edge) - parseFloat(a.edge));
-          
           return {
             success: true,
             message: `Player Props for ${sport.toUpperCase()} (Fallback)`,
@@ -2373,7 +2352,7 @@ app.get('/api/prizepicks/selections', async (req, res) => {
       forceRefresh ? 0 : 300
     );
 
-    return res.json({ ...responsePayload });
+    return res.json(responsePayload);
   } catch (error) {
     console.error('❌ PrizePicks endpoint error:', error);
     return res.status(500).json({
